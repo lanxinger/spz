@@ -1,5 +1,24 @@
 import Foundation
-import zlib
+import MetalPerformanceShaders
+
+// MARK: - MPS Setup
+private let device = MTLCreateSystemDefaultDevice()!
+private let commandQueue = device.makeCommandQueue()!
+
+private func createMPSMatrix(from data: [Float], rows: Int, columns: Int) -> MPSMatrix? {
+    let descriptor = MPSMatrixDescriptor(rows: rows,
+                                       columns: columns,
+                                       rowBytes: columns * MemoryLayout<Float>.stride,
+                                       dataType: .float32)
+    
+    guard let matrix = device.makeBuffer(bytes: data,
+                                       length: data.count * MemoryLayout<Float>.stride,
+                                       options: .storageModeShared) else {
+        return nil
+    }
+    
+    return MPSMatrix(buffer: matrix, descriptor: descriptor)
+}
 
 // Import zlib types and constants
 private let ZLIB_VERSION = "1.2.11"
@@ -781,5 +800,97 @@ private func processPointsByCacheLine(_ packed: PackedGaussians, result: inout G
                 }
             }
         }
+    }
+}
+
+private func processSHBatchMPS(_ cloud: GaussianCloud, startIdx: Int, count: Int) -> [UInt8] {
+    // Fall back to CPU implementation if MPS is not available
+    if #available(iOS 10.0, macOS 10.13, *) {
+        let shDim = dimForDegree(cloud.shDegree)
+        let sh1Bits = 5
+        let shRestBits = 4
+        
+        // Create input matrix
+        let source = Array(cloud.sh[startIdx..<(startIdx + count * shDim * 3)])
+        guard let inputMatrix = createMPSMatrix(from: source,
+                                              rows: count,
+                                              columns: shDim * 3) else {
+            return processSHBatch(cloud, startIdx: startIdx, count: count)
+        }
+        
+        // Create scale and bias matrices
+        let scaleData: [Float] = [128.0]
+        let biasData: [Float] = [128.0]
+        
+        guard let scaleMatrix = createMPSMatrix(from: scaleData, rows: 1, columns: 1),
+              let biasMatrix = createMPSMatrix(from: biasData, rows: 1, columns: 1) else {
+            return processSHBatch(cloud, startIdx: startIdx, count: count)
+        }
+        
+        // Create output buffer
+        guard let outputBuffer = device.makeBuffer(length: count * shDim * 3 * MemoryLayout<Float>.stride,
+                                                 options: .storageModeShared) else {
+            return processSHBatch(cloud, startIdx: startIdx, count: count)
+        }
+        
+        let outputDescriptor = MPSMatrixDescriptor(rows: count,
+                                                 columns: shDim * 3,
+                                                 rowBytes: shDim * 3 * MemoryLayout<Float>.stride,
+                                                 dataType: .float32)
+        let outputMatrix = MPSMatrix(buffer: outputBuffer, descriptor: outputDescriptor)
+        
+        // Create command buffer
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            return processSHBatch(cloud, startIdx: startIdx, count: count)
+        }
+        
+        // Scale and bias
+        let scaleKernel = MPSMatrixMultiplication(device: device,
+                                                transposeLeft: false,
+                                                transposeRight: false,
+                                                resultRows: count,
+                                                resultColumns: shDim * 3,
+                                                interiorColumns: 1,
+                                                alpha: 1.0,
+                                                beta: 0.0)
+        
+        scaleKernel.encode(commandBuffer: commandBuffer,
+                          leftMatrix: inputMatrix,
+                          rightMatrix: scaleMatrix,
+                          resultMatrix: outputMatrix)
+        
+        // Add bias using a matrix multiplication
+        let biasKernel = MPSMatrixMultiplication(device: device,
+                                               transposeLeft: false,
+                                               transposeRight: false,
+                                               resultRows: count,
+                                               resultColumns: shDim * 3,
+                                               interiorColumns: 1,
+                                               alpha: 1.0,
+                                               beta: 1.0)
+        
+        biasKernel.encode(commandBuffer: commandBuffer,
+                         leftMatrix: outputMatrix,
+                         rightMatrix: biasMatrix,
+                         resultMatrix: outputMatrix)
+        
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        
+        // Convert to UInt8 with bucketing
+        let result = outputBuffer.contents().assumingMemoryBound(to: Float.self)
+        var quantized = [UInt8](repeating: 0, count: count * shDim * 3)
+        
+        for i in 0..<(count * shDim * 3) {
+            let bucketSize = i < (9 * count) ? 1 << (8 - sh1Bits) : 1 << (8 - shRestBits)
+            let value = result[i]
+            let bucketed = ((value + Float(bucketSize) / 2) / Float(bucketSize)).rounded(.down) * Float(bucketSize)
+            quantized[i] = UInt8(max(0, min(255, bucketed)))
+        }
+        
+        return quantized
+    } else {
+        // Fall back to CPU implementation for older OS versions
+        return processSHBatch(cloud, startIdx: startIdx, count: count)
     }
 }
