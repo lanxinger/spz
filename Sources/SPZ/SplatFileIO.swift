@@ -700,3 +700,86 @@ private func processPointsInParallel(packed: PackedGaussians, result: inout Gaus
         result.positions.replaceSubrange(destStart..<(destStart + count), with: localResult)
     }
 }
+
+private func processSHBatch(_ cloud: GaussianCloud, startIdx: Int, count: Int) -> [UInt8] {
+    let shDim = dimForDegree(cloud.shDegree)
+    let sh1Bits = 5
+    let shRestBits = 4
+    var result = [UInt8](repeating: 0, count: count * shDim * 3)
+    
+    // Process 4 coefficients at a time using SIMD
+    let simdCount = (count * shDim * 3) / 4 * 4
+    let source = cloud.sh
+    
+    for i in stride(from: 0, to: simdCount, by: 4) {
+        let values = SIMD4<Float>(
+            source[startIdx + i],
+            source[startIdx + i + 1],
+            source[startIdx + i + 2],
+            source[startIdx + i + 3]
+        )
+        
+        let bucketSize: Float = i < (9 * count) ? Float(1 << (8 - sh1Bits)) : Float(1 << (8 - shRestBits))
+        let bucketSizeVec = SIMD4<Float>(repeating: bucketSize)
+        
+        // Quantize values
+        let quantized = values * 128.0 + SIMD4<Float>(repeating: 128.0)
+        let rounded = quantized.rounded(.toNearestOrAwayFromZero)
+        let halfBucket = bucketSizeVec * 0.5
+        let bucketed = ((rounded + halfBucket) / bucketSizeVec).rounded(.towardZero) * bucketSizeVec
+        
+        // Manual clamping between 0 and 255
+        let clamped = SIMD4<Float>(
+            max(0, min(255, bucketed[0])),
+            max(0, min(255, bucketed[1])),
+            max(0, min(255, bucketed[2])),
+            max(0, min(255, bucketed[3]))
+        )
+        
+        for j in 0..<4 {
+            result[i + j] = UInt8(clamped[j])
+        }
+    }
+    
+    // Handle remaining coefficients
+    for i in simdCount..<(count * shDim * 3) {
+        let bucketSize = i < (9 * count) ? 1 << (8 - sh1Bits) : 1 << (8 - shRestBits)
+        result[i] = quantizeSH(source[startIdx + i], bucketSize: bucketSize)
+    }
+    
+    return result
+}
+
+private func processPointsByCacheLine(_ packed: PackedGaussians, result: inout GaussianCloud) {
+    // Process points in cache-line sized chunks (64 bytes typically)
+    let pointsPerCacheLine = 64 / MemoryLayout<Float>.stride
+    let count = packed.numPoints
+    
+    for baseIdx in stride(from: 0, to: count, by: pointsPerCacheLine) {
+        let endIdx = min(baseIdx + pointsPerCacheLine, count)
+        // Process this cache-line sized chunk of points
+        for pointIdx in baseIdx..<endIdx {
+            let posIdx = pointIdx * 3
+            if packed.usesFloat16 {
+                let baseIn = pointIdx * 6  // 2 bytes per component
+                for j in 0..<3 {
+                    let halfValue = UInt16(packed.positions[baseIn + j * 2]) |
+                                  (UInt16(packed.positions[baseIn + j * 2 + 1]) << 8)
+                    result.positions[posIdx + j] = float16ToFloat32(halfValue)
+                }
+            } else {
+                let baseIn = pointIdx * 9  // 3 bytes per component
+                let scale = 1.0 / Float(1 << packed.fractionalBits)
+                for j in 0..<3 {
+                    var fixed32: Int32 = Int32(packed.positions[baseIn + j * 3])
+                    fixed32 |= Int32(packed.positions[baseIn + j * 3 + 1]) << 8
+                    fixed32 |= Int32(packed.positions[baseIn + j * 3 + 2]) << 16
+                    if (fixed32 & 0x800000) != 0 {
+                        fixed32 |= Int32(bitPattern: 0xFF000000)
+                    }
+                    result.positions[posIdx + j] = Float(fixed32) * scale
+                }
+            }
+        }
+    }
+}

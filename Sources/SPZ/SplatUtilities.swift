@@ -166,4 +166,54 @@ public func decompressGzipped(_ data: Data) -> Data? {
         
         return decompressed
     }
-} 
+}
+
+// Memory pool for temporary buffers
+private final class MemoryPool {
+    private var buffers: [[UInt8]] = []
+    private let lock = NSLock()
+    
+    func acquire(size: Int) -> [UInt8] {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        if let index = buffers.firstIndex(where: { $0.count >= size }) {
+            let buffer = buffers[index]
+            buffers.remove(at: index)
+            return buffer
+        }
+        
+        return [UInt8](repeating: 0, count: size)
+    }
+    
+    func release(_ buffer: [UInt8]) {
+        lock.lock()
+        buffers.append(buffer)
+        lock.unlock()
+    }
+}
+
+private let sharedMemoryPool = MemoryPool()
+
+/// Compresses data using gzip compression in parallel
+public func compressGzippedParallel(_ data: Data, chunkSize: Int = 1024 * 1024) -> Data? {
+    let chunks = stride(from: 0, to: data.count, by: chunkSize).map {
+        data[$0..<min($0 + chunkSize, data.count)]
+    }
+    
+    var compressedChunks: [Data?] = Array(repeating: nil, count: chunks.count)
+    
+    DispatchQueue.concurrentPerform(iterations: chunks.count) { i in
+        compressedChunks[i] = compressGzipped(chunks[i])
+    }
+    
+    guard !compressedChunks.contains(where: { $0 == nil }) else { return nil }
+    
+    var result = Data()
+    compressedChunks.forEach { chunk in
+        if let chunk = chunk {
+            result.append(chunk)
+        }
+    }
+    return result
+}

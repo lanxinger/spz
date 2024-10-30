@@ -204,4 +204,76 @@ private func float16ToFloat32(_ half: UInt16) -> Float {
     
     // Non-zero exponent implies 1 in the mantissa decimal
     return signMul * Float(pow(2.0, Double(exponent) - 15.0)) * (1.0 + Float(mantissa) / 1024.0)
-} 
+}
+
+// Packed memory layout for better cache utilization
+@frozen
+public struct PackedPoint {
+    var position: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8)  // 9 bytes
+    var rotation: (UInt8, UInt8, UInt8)  // 3 bytes
+    var scale: (UInt8, UInt8, UInt8)     // 3 bytes
+    var color: (UInt8, UInt8, UInt8)     // 3 bytes
+    var alpha: UInt8                      // 1 byte
+    // Total: 19 bytes, aligned to 4 bytes = 20 bytes
+}
+
+private func unpackPositionsVectorized(_ packed: PackedGaussians) -> [Float] {
+    let count = packed.numPoints
+    var result = [Float](repeating: 0, count: count * 3)
+    
+    if packed.usesFloat16 {
+        // Process 4 positions (12 components) at a time
+        let simdCount = (count * 3) / 12 * 12
+        for i in stride(from: 0, to: simdCount, by: 12) {
+            let sourceIdx = i * 2
+            let values = packed.positions.withUnsafeBytes { ptr -> SIMD4<Float> in
+                let uint16Ptr = ptr.baseAddress!.assumingMemoryBound(to: UInt16.self)
+                return SIMD4(
+                    float16ToFloat32(uint16Ptr[sourceIdx/2]),
+                    float16ToFloat32(uint16Ptr[sourceIdx/2 + 1]),
+                    float16ToFloat32(uint16Ptr[sourceIdx/2 + 2]),
+                    float16ToFloat32(uint16Ptr[sourceIdx/2 + 3])
+                )
+            }
+            
+            for j in 0..<4 {
+                result[i/2 + j] = values[j]
+            }
+        }
+    } else {
+        let scale = 1.0 / Float(1 << packed.fractionalBits)
+        // Process 4 positions (12 components) at a time
+        let simdCount = (count * 3) / 12 * 12
+        for i in stride(from: 0, to: simdCount, by: 12) {
+            let sourceIdx = i * 3
+            var fixed32 = SIMD4<Int32>()
+            
+            for j in 0..<4 {
+                let idx = sourceIdx + j * 3
+                fixed32[j] = Int32(packed.positions[idx]) |
+                            (Int32(packed.positions[idx + 1]) << 8) |
+                            (Int32(packed.positions[idx + 2]) << 16)
+                if (fixed32[j] & 0x800000) != 0 {
+                    fixed32[j] |= Int32(bitPattern: 0xFF000000)
+                }
+            }
+            
+            let floatValues = SIMD4<Float>(fixed32) * scale
+            for j in 0..<4 {
+                result[i/3 + j] = floatValues[j]
+            }
+        }
+    }
+    
+    return result
+}
+
+private func prefetchNextChunk(_ data: UnsafePointer<UInt8>, offset: Int, size: Int) {
+    #if arch(arm64)
+    // On ARM64, we can use memory barriers instead of prefetch
+    for i in stride(from: 0, to: size, by: 64) {
+        // Memory barrier to ensure data is loaded into cache
+        _ = data[offset + i]
+    }
+    #endif
+}
