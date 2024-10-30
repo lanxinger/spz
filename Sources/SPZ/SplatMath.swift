@@ -26,29 +26,12 @@ extension Quat4f {
     /// - Parameter v: The vector to rotate
     /// - Returns: The rotated vector
     func rotate(_ v: Vec3f) -> Vec3f {
-        let w = self.w
-        let x = self.x
-        let y = self.y
-        let z = self.z
-        
-        let x2 = x + x
-        let y2 = y + y
-        let z2 = z + z
-        let wx2 = w * x2
-        let wy2 = w * y2
-        let wz2 = w * z2
-        let xx2 = x * x2
-        let xy2 = x * y2
-        let xz2 = x * z2
-        let yy2 = y * y2
-        let yz2 = y * z2
-        let zz2 = z * z2
-        
-        return Vec3f(
-            v.x * (1.0 - (yy2 + zz2)) + v.y * (xy2 - wz2) + v.z * (xz2 + wy2),
-            v.x * (xy2 + wz2) + v.y * (1.0 - (xx2 + zz2)) + v.z * (yz2 - wx2),
-            v.x * (xz2 - wy2) + v.y * (yz2 + wx2) + v.z * (1.0 - (xx2 + yy2))
-        )
+        // Use SIMD operations for faster quaternion rotation
+        let q = self
+        let u = SIMD3<Float>(q.x, q.y, q.z)
+        let uv = simd_cross(u, v)
+        let uuv = simd_cross(u, uv)
+        return v + ((uv * q.w) + uuv) * 2
     }
 }
 

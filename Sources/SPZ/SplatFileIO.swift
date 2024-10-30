@@ -596,4 +596,107 @@ private func checkSizes(_ packed: PackedGaussians, numPoints: Int, shDim: Int, u
     guard packed.colors.count == numPoints * 3 else { return false }
     guard packed.sh.count == numPoints * shDim * 3 else { return false }
     return true
-} 
+}
+
+// Use block copy operations for arrays
+private func copyArrays(from source: PackedGaussians, to destination: inout GaussianCloud) {
+    let count = source.numPoints
+    
+    // Copy alphas using unsafe buffers
+    source.alphas.withUnsafeBufferPointer { srcBuf in
+        destination.alphas.withUnsafeMutableBufferPointer { dstBuf in
+            guard let srcPtr = srcBuf.baseAddress,
+                  let dstPtr = dstBuf.baseAddress else { return }
+            // Convert UInt8 to Float while copying
+            for i in 0..<count {
+                dstPtr[i] = Float(srcPtr[i])
+            }
+        }
+    }
+    
+    // Copy positions
+    source.positions.withUnsafeBufferPointer { srcBuf in
+        destination.positions.withUnsafeMutableBufferPointer { dstBuf in
+            guard let srcPtr = srcBuf.baseAddress,
+                  let dstPtr = dstBuf.baseAddress else { return }
+            // Handle position conversion based on format
+            if source.usesFloat16 {
+                for i in 0..<count {
+                    let baseIn = i * 6  // 2 bytes per component
+                    let baseOut = i * 3
+                    for j in 0..<3 {
+                        let halfValue = UInt16(srcPtr[baseIn + j * 2]) |
+                                      (UInt16(srcPtr[baseIn + j * 2 + 1]) << 8)
+                        dstPtr[baseOut + j] = float16ToFloat32(halfValue)
+                    }
+                }
+            } else {
+                let scale = 1.0 / Float(1 << source.fractionalBits)
+                for i in 0..<count {
+                    let baseIn = i * 9  // 3 bytes per component
+                    let baseOut = i * 3
+                    for j in 0..<3 {
+                        var fixed32: Int32 = Int32(srcPtr[baseIn + j * 3])
+                        fixed32 |= Int32(srcPtr[baseIn + j * 3 + 1]) << 8
+                        fixed32 |= Int32(srcPtr[baseIn + j * 3 + 2]) << 16
+                        if (fixed32 & 0x800000) != 0 {
+                            fixed32 |= Int32(bitPattern: 0xFF000000)
+                        }
+                        dstPtr[baseOut + j] = Float(fixed32) * scale
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Use DispatchQueue for parallel processing of large point sets
+private func processPointsInParallel(packed: PackedGaussians, result: inout GaussianCloud) {
+    let pointsPerThread = 1000
+    let threadCount = (packed.numPoints + pointsPerThread - 1) / pointsPerThread
+    
+    // Create a temporary array to store results from each thread
+    var threadResults = [(Range<Int>, [Float])](repeating: (0..<0, []), count: threadCount)
+    
+    DispatchQueue.concurrentPerform(iterations: threadCount) { threadIndex in
+        let start = threadIndex * pointsPerThread
+        let end = min(start + pointsPerThread, packed.numPoints)
+        var localResult = [Float](repeating: 0, count: (end - start) * 3)
+        
+        // Process points in this range
+        for i in start..<end {
+            let localIndex = (i - start) * 3
+            if packed.usesFloat16 {
+                // Process float16 positions
+                let baseIdx = i * 6
+                for j in 0..<3 {
+                    let halfValue = UInt16(packed.positions[baseIdx + j * 2]) |
+                                  (UInt16(packed.positions[baseIdx + j * 2 + 1]) << 8)
+                    localResult[localIndex + j] = float16ToFloat32(halfValue)
+                }
+            } else {
+                // Process fixed-point positions
+                let baseIdx = i * 9
+                let scale = 1.0 / Float(1 << packed.fractionalBits)
+                for j in 0..<3 {
+                    var fixed32: Int32 = Int32(packed.positions[baseIdx + j * 3])
+                    fixed32 |= Int32(packed.positions[baseIdx + j * 3 + 1]) << 8
+                    fixed32 |= Int32(packed.positions[baseIdx + j * 3 + 2]) << 16
+                    if (fixed32 & 0x800000) != 0 {
+                        fixed32 |= Int32(bitPattern: 0xFF000000)
+                    }
+                    localResult[localIndex + j] = Float(fixed32) * scale
+                }
+            }
+        }
+        
+        threadResults[threadIndex] = (start..<end, localResult)
+    }
+    
+    // Combine results from all threads
+    for (range, localResult) in threadResults {
+        let destStart = range.startIndex * 3
+        let count = range.count * 3
+        result.positions.replaceSubrange(destStart..<(destStart + count), with: localResult)
+    }
+}

@@ -59,9 +59,12 @@ public func degreeForDim(_ dim: Int) -> Int {
 
 // MARK: - Compression Utilities
 
+/// Use larger buffer sizes for compression
+private let compressionBufferSize = 64 * 1024  // 64KB buffer
+
 /// Compresses data using gzip compression
 public func compressGzipped(_ data: Data) -> Data? {
-    let destinationBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: data.count)
+    let destinationBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: compressionBufferSize)
     defer { destinationBuffer.deallocate() }
     
     let algorithm = COMPRESSION_ZLIB

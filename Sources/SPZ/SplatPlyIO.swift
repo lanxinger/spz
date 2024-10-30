@@ -10,7 +10,7 @@ extension GaussianCloud {
         defer { try? fileHandle.close() }
         
         // Read first few bytes to check format
-        let headerBuffer = try fileHandle.read(upToCount: 1024) ?? Data()
+        let headerBuffer = readHeaderBuffer(fileHandle: fileHandle)
         guard let headerStart = String(data: headerBuffer, encoding: .ascii) else {
             throw SPZError.invalidFormat("Not a valid PLY file")
         }
@@ -349,21 +349,33 @@ extension FileHandle {
         let bufferSize = 1
         
         while true {
-            do {
-                let read = try self.read(upToCount: bufferSize) ?? Data()
-                if read.isEmpty { break }
-                
-                if let byte = read.first {
-                    if byte == UInt8(ascii: "\n") {
-                        break
-                    }
-                    line.append(byte)
+            let data: Data
+            if #available(iOS 13.4, macOS 10.15.4, *) {
+                guard let read = try? self.read(upToCount: bufferSize) else { break }
+                data = read
+            } else {
+                data = self.readData(ofLength: bufferSize)
+            }
+            
+            if data.isEmpty { break }
+            
+            if let byte = data.first {
+                if byte == UInt8(ascii: "\n") {
+                    break
                 }
-            } catch {
-                return nil
+                line.append(byte)
             }
         }
         
         return String(data: line, encoding: .ascii)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+// Add this function at the top of the file, before loadFromPly
+private func readHeaderBuffer(fileHandle: FileHandle) -> Data {
+    if #available(iOS 13.4, macOS 10.15.4, *) {
+        return (try? fileHandle.read(upToCount: 1024)) ?? Data()
+    } else {
+        return fileHandle.readData(ofLength: 1024)
     }
 } 
