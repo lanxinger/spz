@@ -21,6 +21,28 @@ private func createMPSMatrix(from data: [Float], rows: Int, columns: Int) -> MPS
     return MPSMatrix(buffer: matrix, descriptor: descriptor)
 }
 
+// Add after createMPSMatrix function
+
+private func batchMatrixOperation(
+    inputs: [Float],
+    inputRows: Int,
+    inputCols: Int,
+    operation: (MPSMatrix, MPSCommandBuffer) -> Void
+) -> [Float]? {
+    guard let inputMatrix = createMPSMatrix(from: inputs, rows: inputRows, columns: inputCols),
+          let commandBuffer = commandQueue.makeCommandBuffer() as? MPSCommandBuffer else {
+        return nil
+    }
+    
+    operation(inputMatrix, commandBuffer)
+    
+    commandBuffer.commit()
+    commandBuffer.waitUntilCompleted()
+    
+    let result = inputMatrix.data.contents().assumingMemoryBound(to: Float.self)
+    return Array(UnsafeBufferPointer(start: result, count: inputs.count))
+}
+
 // MARK: - Vector Operations
 extension Vec3f {
     /// Returns a normalized version of the vector (magnitude of 1)

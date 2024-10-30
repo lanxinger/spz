@@ -1,4 +1,95 @@
 import Foundation
+import MetalPerformanceShaders
+
+// Add shared MPS resources at file scope
+private let device = MTLCreateSystemDefaultDevice()!
+private let commandQueue = device.makeCommandQueue()!
+
+// Add helper function at file scope
+private func batchMatrixOperation(
+    inputs: [Float],
+    inputRows: Int,
+    inputCols: Int,
+    operation: (MPSMatrix, MPSCommandBuffer) -> Void
+) -> [Float]? {
+    guard let inputMatrix = createMPSMatrix(from: inputs, rows: inputRows, columns: inputCols),
+          let commandBuffer = commandQueue.makeCommandBuffer() as? MPSCommandBuffer else {
+        return nil
+    }
+    
+    operation(inputMatrix, commandBuffer)
+    
+    commandBuffer.commit()
+    commandBuffer.waitUntilCompleted()
+    
+    let result = inputMatrix.data.contents().assumingMemoryBound(to: Float.self)
+    return Array(UnsafeBufferPointer(start: result, count: inputs.count))
+}
+
+private func createMPSMatrix(from data: [Float], rows: Int, columns: Int) -> MPSMatrix? {
+    let descriptor = MPSMatrixDescriptor(rows: rows,
+                                       columns: columns,
+                                       rowBytes: columns * MemoryLayout<Float>.stride,
+                                       dataType: .float32)
+    
+    guard let matrix = device.makeBuffer(bytes: data,
+                                       length: data.count * MemoryLayout<Float>.stride,
+                                       options: .storageModeShared) else {
+        return nil
+    }
+    
+    return MPSMatrix(buffer: matrix, descriptor: descriptor)
+}
+
+// Add at the top of the file, after imports
+private class MPSMatrixScale {
+    let device: MTLDevice
+    let alpha: Float
+    let beta: Float
+    let kernel: MPSMatrixUnaryKernel
+    
+    init(device: MTLDevice, alpha: Float, beta: Float = 0.0) {
+        self.device = device
+        self.alpha = alpha
+        self.beta = beta
+        self.kernel = MPSMatrixUnaryKernel(device: device)
+    }
+    
+    func encode(commandBuffer: MPSCommandBuffer, inputMatrix: MPSMatrix, resultMatrix: MPSMatrix) {
+        // Create a compute pipeline for the scale operation
+        let functionConstants = MTLFunctionConstantValues()
+        var alpha = self.alpha
+        var beta = self.beta
+        functionConstants.setConstantValue(&alpha, type: .float, index: 0)
+        functionConstants.setConstantValue(&beta, type: .float, index: 1)
+        
+        let library = device.makeDefaultLibrary()
+        guard let function = try? library?.makeFunction(name: "matrixScale", constantValues: functionConstants) else {
+            return
+        }
+        
+        guard let pipeline = try? device.makeComputePipelineState(function: function),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            return
+        }
+        
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputMatrix.data, offset: 0, index: 0)
+        encoder.setBuffer(resultMatrix.data, offset: 0, index: 1)
+        encoder.setBytes(&alpha, length: MemoryLayout<Float>.size, index: 2)
+        encoder.setBytes(&beta, length: MemoryLayout<Float>.size, index: 3)
+        
+        let threadsPerGroup = MTLSize(width: 16, height: 16, depth: 1)
+        let threadGroups = MTLSize(
+            width: (inputMatrix.rows + 15) / 16,
+            height: (inputMatrix.columns + 15) / 16,
+            depth: 1
+        )
+        
+        encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadsPerGroup)
+        encoder.endEncoding()
+    }
+}
 
 /// Represents a single inflated gaussian. Each gaussian has 236 bytes. Although the data is easier
 /// to interpret in this format, it is not more precise than the packed format, since it was inflated.
@@ -277,3 +368,113 @@ private func prefetchNextChunk(_ data: UnsafePointer<UInt8>, offset: Int, size: 
     }
     #endif
 }
+
+private func unpackColorsVectorized(_ packed: PackedGaussians) -> [Float] {
+    let count = packed.numPoints
+    
+    // Create input matrix from packed colors
+    let inputs = packed.colors.map { Float($0) }
+    
+    return batchMatrixOperation(
+        inputs: inputs,
+        inputRows: count,
+        inputCols: 3
+    ) { matrix, commandBuffer in
+        let scale = MPSMatrixScale(device: device, 
+                                 alpha: 1.0 / (255.0 * colorScale), 
+                                 beta: -0.5 / colorScale)
+        scale.encode(commandBuffer: commandBuffer, inputMatrix: matrix, resultMatrix: matrix)
+    } ?? {
+        // Fallback to CPU implementation
+        var result = [Float](repeating: 0, count: count * 3)
+        for i in 0..<(count * 3) {
+            result[i] = (Float(packed.colors[i]) / 255.0 - 0.5) / colorScale
+        }
+        return result
+    }()
+}
+
+private func unpackScalesVectorized(_ packed: PackedGaussians) -> [Float] {
+    let count = packed.numPoints
+    
+    // Create input matrix from packed scales
+    let inputs = packed.scales.map { Float($0) }
+    
+    return batchMatrixOperation(
+        inputs: inputs,
+        inputRows: count,
+        inputCols: 3
+    ) { matrix, commandBuffer in
+        let scale = MPSMatrixScale(device: device, 
+                                 alpha: 1.0 / 16.0, 
+                                 beta: -10.0)
+        scale.encode(commandBuffer: commandBuffer, inputMatrix: matrix, resultMatrix: matrix)
+    } ?? {
+        // Fallback to CPU implementation
+        var result = [Float](repeating: 0, count: count * 3)
+        for i in 0..<(count * 3) {
+            result[i] = Float(packed.scales[i]) / 16.0 - 10.0
+        }
+        return result
+    }()
+}
+
+private func unpackAlphasVectorized(_ packed: PackedGaussians) -> [Float] {
+    let count = packed.numPoints
+    
+    // Create input matrix from packed alphas
+    let inputs = packed.alphas.map { Float($0) }
+    
+    return batchMatrixOperation(
+        inputs: inputs,
+        inputRows: count,
+        inputCols: 1
+    ) { matrix, commandBuffer in
+        // First scale to [0,1]
+        let scale = MPSMatrixScale(device: device, alpha: 1.0 / 255.0)
+        scale.encode(commandBuffer: commandBuffer, inputMatrix: matrix, resultMatrix: matrix)
+        
+        // Then apply inverse sigmoid using a compute pipeline
+        let library = device.makeDefaultLibrary()
+        let function = library?.makeFunction(name: "invSigmoid")
+        let pipeline = try? device.makeComputePipelineState(function: function!)
+        
+        guard let pipeline = pipeline,
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            return
+        }
+        
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(matrix.data, offset: 0, index: 0)
+        
+        let threadsPerGroup = pipeline.maxTotalThreadsPerThreadgroup
+        let threadGroups = (count + threadsPerGroup - 1) / threadsPerGroup
+        
+        encoder.dispatchThreadgroups(MTLSize(width: threadGroups, height: 1, depth: 1),
+                                   threadsPerThreadgroup: MTLSize(width: threadsPerGroup, height: 1, depth: 1))
+        encoder.endEncoding()
+    } ?? {
+        // Fallback to CPU implementation
+        var result = [Float](repeating: 0, count: count)
+        for i in 0..<count {
+            result[i] = invSigmoid(Float(packed.alphas[i]) / 255.0)
+        }
+        return result
+    }()
+}
+
+// Add the inverse sigmoid Metal shader:
+#if os(macOS)
+let invSigmoidShader = """
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void invSigmoid(
+    device float* data [[buffer(0)]],
+    uint id [[thread_position_in_grid]]
+) {
+    float x = data[id];
+    data[id] = log(x / (1.0 - x));
+}
+"""
+#endif
