@@ -1,5 +1,14 @@
 import Foundation
 import MetalPerformanceShaders
+import simd
+
+// Import required dependencies
+import struct simd.simd_float3
+import struct simd.simd_float4
+import func simd.simd_length
+import func simd.simd_dot
+
+// No need to import SplatTypes as it's in the same module
 
 // Add shared MPS resources at file scope
 private let device = MTLCreateSystemDefaultDevice()!
@@ -41,54 +50,13 @@ private func createMPSMatrix(from data: [Float], rows: Int, columns: Int) -> MPS
     return MPSMatrix(buffer: matrix, descriptor: descriptor)
 }
 
-// Add at the top of the file, after imports
-private class MPSMatrixScale {
-    let device: MTLDevice
-    let alpha: Float
-    let beta: Float
-    let kernel: MPSMatrixUnaryKernel
-    
-    init(device: MTLDevice, alpha: Float, beta: Float = 0.0) {
-        self.device = device
-        self.alpha = alpha
-        self.beta = beta
-        self.kernel = MPSMatrixUnaryKernel(device: device)
+// Simplify our approach - don't use MPSMatrixScale since it's causing problems
+private func scaleMatrix(_ data: [Float], scale: Float, offset: Float = 0.0) -> [Float] {
+    var result = [Float](repeating: 0, count: data.count)
+    for i in 0..<data.count {
+        result[i] = data[i] * scale + offset
     }
-    
-    func encode(commandBuffer: MPSCommandBuffer, inputMatrix: MPSMatrix, resultMatrix: MPSMatrix) {
-        // Create a compute pipeline for the scale operation
-        let functionConstants = MTLFunctionConstantValues()
-        var alpha = self.alpha
-        var beta = self.beta
-        functionConstants.setConstantValue(&alpha, type: .float, index: 0)
-        functionConstants.setConstantValue(&beta, type: .float, index: 1)
-        
-        let library = device.makeDefaultLibrary()
-        guard let function = try? library?.makeFunction(name: "matrixScale", constantValues: functionConstants) else {
-            return
-        }
-        
-        guard let pipeline = try? device.makeComputePipelineState(function: function),
-              let encoder = commandBuffer.makeComputeCommandEncoder() else {
-            return
-        }
-        
-        encoder.setComputePipelineState(pipeline)
-        encoder.setBuffer(inputMatrix.data, offset: 0, index: 0)
-        encoder.setBuffer(resultMatrix.data, offset: 0, index: 1)
-        encoder.setBytes(&alpha, length: MemoryLayout<Float>.size, index: 2)
-        encoder.setBytes(&beta, length: MemoryLayout<Float>.size, index: 3)
-        
-        let threadsPerGroup = MTLSize(width: 16, height: 16, depth: 1)
-        let threadGroups = MTLSize(
-            width: (inputMatrix.rows + 15) / 16,
-            height: (inputMatrix.columns + 15) / 16,
-            depth: 1
-        )
-        
-        encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadsPerGroup)
-        encoder.endEncoding()
-    }
+    return result
 }
 
 /// Represents a single inflated gaussian. Each gaussian has 236 bytes. Although the data is easier
@@ -138,25 +106,83 @@ public struct PackedGaussian {
         shB = Array(repeating: 0, count: 15)
     }
     
-    func unpack(usesFloat16: Bool, fractionalBits: Int) -> UnpackedGaussian {
+    func unpack(usesFloat16: Bool, fractionalBits: Int, converter: CoordinateConverter? = nil) -> UnpackedGaussian {
         var result = UnpackedGaussian()
+        let c = converter ?? CoordinateConverter()
         
         // Use unsafe buffers for faster access
         position.withUnsafeBufferPointer { posPtr in
             rotation.withUnsafeBufferPointer { rotPtr in
                 scale.withUnsafeBufferPointer { scalePtr in
-                    // Unpack operations using direct pointer access
+                    // Unpack position based on format
                     if usesFloat16 {
+                        guard position.count >= 6 else { return }
+                        
                         let halfPtr = posPtr.baseAddress!.withMemoryRebound(to: UInt16.self, capacity: 3) { $0 }
-                        result.position = Vec3f(
-                            float16ToFloat32(halfPtr[0]),
-                            float16ToFloat32(halfPtr[1]),
-                            float16ToFloat32(halfPtr[2])
-                        )
+                        for i in 0..<3 {
+                            result.position[i] = c.flipP[i] * float16ToFloat32(halfPtr[i])
+                        }
+                    } else {
+                        guard position.count >= 9 else { return }
+                        
+                        // Decode 24-bit fixed point coordinates
+                        let scale = 1.0 / Float(1 << fractionalBits)
+                        for i in 0..<3 {
+                            var fixed32: Int32 = Int32(position[i * 3])
+                            fixed32 |= Int32(position[i * 3 + 1]) << 8
+                            fixed32 |= Int32(position[i * 3 + 2]) << 16
+                            if (fixed32 & 0x800000) != 0 {
+                                fixed32 |= Int32(bitPattern: 0xFF000000)  // Sign extension
+                            }
+                            result.position[i] = c.flipP[i] * (Float(fixed32) * scale)
+                        }
                     }
-                    // ... rest of unpacking logic
+                    
+                    // Unpack scale
+                    guard scale.count >= 3 else { return }
+                    for i in 0..<3 {
+                        result.scale[i] = Float(scale[i]) / 16.0 - 10.0
+                    }
+                    
+                    // Unpack rotation
+                    guard rotation.count >= 3 else { return }
+                    let xyz = Vec3f(
+                        Float(rotation[0]),
+                        Float(rotation[1]),
+                        Float(rotation[2])
+                    ) / 127.5 - Vec3f(1, 1, 1)
+                    
+                    // Apply coordinate flips
+                    let flippedXyz = Vec3f(
+                        xyz.x * c.flipQ.x,
+                        xyz.y * c.flipQ.y,
+                        xyz.z * c.flipQ.z
+                    )
+                    
+                    result.rotation.x = flippedXyz.x
+                    result.rotation.y = flippedXyz.y
+                    result.rotation.z = flippedXyz.z
+                    result.rotation.w = sqrt(max(0.0, 1.0 - flippedXyz.squaredNorm))
                 }
             }
+        }
+        
+        // Unpack alpha
+        result.alpha = invSigmoid(Float(alpha) / 255.0)
+        
+        // Unpack color
+        guard color.count >= 3 else { return result }
+        for i in 0..<3 {
+            result.color[i] = (Float(color[i]) / 255.0 - 0.5) / colorScale
+        }
+        
+        // Unpack SH coefficients
+        let shCount = min(15, shR.count)
+        for i in 0..<shCount {
+            guard i < c.flipSh.count else { break }
+            result.shR[i] = c.flipSh[i] * unquantizeSH(shR[i])
+            result.shG[i] = c.flipSh[i] * unquantizeSH(shG[i])
+            result.shB[i] = c.flipSh[i] * unquantizeSH(shB[i])
         }
         
         return result
@@ -183,7 +209,6 @@ public struct PackedGaussians {
     }
     
     func at(_ index: Int) -> PackedGaussian {
-        print("[SPZ] Getting gaussian at index \(index)")
         var result = PackedGaussian()
         let positionBits = usesFloat16 ? 6 : 9
         let start3 = index * 3
@@ -191,68 +216,44 @@ public struct PackedGaussians {
         
         // Verify index is in bounds
         guard index >= 0 && index < numPoints else {
-            print("[SPZ] Error: Index \(index) out of bounds (numPoints: \(numPoints))")
             return result
         }
         
-        print("[SPZ] Array sizes: positions=\(positions.count), scales=\(scales.count), rotations=\(rotations.count), colors=\(colors.count), alphas=\(alphas.count), sh=\(sh.count)")
-        print("[SPZ] Accessing position data: start=\(posStart), bits=\(positionBits), total=\(positions.count)")
-        
-        // Verify array bounds for position data
+        // Check bounds for position data
         guard posStart + positionBits <= positions.count else {
-            print("[SPZ] Error: Position data out of bounds at index \(index) (trying to access \(posStart + positionBits) but have \(positions.count) bytes)")
             return result
         }
         
         // Copy position data safely
-        result.position = []
-        for i in 0..<positionBits {
-            result.position.append(positions[posStart + i])
-        }
+        result.position = Array(positions[posStart..<(posStart + positionBits)])
         
-        print("[SPZ] Accessing component data: start=\(start3), total=\(scales.count)/\(rotations.count)/\(colors.count)")
-        
-        // Verify array bounds for other components
+        // Check bounds for other components
         guard start3 + 3 <= scales.count,
               start3 + 3 <= rotations.count,
               start3 + 3 <= colors.count,
               index < alphas.count else {
-            print("[SPZ] Error: Component data out of bounds at index \(index)")
-            print("[SPZ] Required: \(start3 + 3) bytes, have scales=\(scales.count), rotations=\(rotations.count), colors=\(colors.count)")
             return result
         }
         
         // Copy other components safely
-        result.scale = []
-        result.rotation = []
-        result.color = []
-        for i in 0..<3 {
-            result.scale.append(scales[start3 + i])
-            result.rotation.append(rotations[start3 + i])
-            result.color.append(colors[start3 + i])
-        }
+        result.scale = Array(scales[start3..<(start3 + 3)])
+        result.rotation = Array(rotations[start3..<(start3 + 3)])
+        result.color = Array(colors[start3..<(start3 + 3)])
         result.alpha = alphas[index]
         
         // Copy spherical harmonics
         let shDim = dimForDegree(shDegree)
         let shStart = index * shDim * 3
         
-        print("[SPZ] Accessing SH data: start=\(shStart), dim=\(shDim), total=\(sh.count)")
-        
         // Verify SH array bounds
         guard shStart + (shDim * 3) <= sh.count else {
-            print("[SPZ] Error: SH data out of bounds at index \(index)")
-            print("[SPZ] Required: \(shStart + (shDim * 3)) bytes, have \(sh.count)")
             return result
         }
         
         // Copy SH data safely
         for j in 0..<shDim {
             let idx = shStart + j * 3
-            guard idx + 2 < sh.count else {
-                print("[SPZ] Error: SH coefficient out of bounds at index \(idx)")
-                break
-            }
+            guard idx + 2 < sh.count else { break }
             result.shR[j] = sh[idx]
             result.shG[j] = sh[idx + 1]
             result.shB[j] = sh[idx + 2]
@@ -268,8 +269,8 @@ public struct PackedGaussians {
         return result
     }
     
-    func unpack(_ index: Int) -> UnpackedGaussian {
-        at(index).unpack(usesFloat16: usesFloat16, fractionalBits: fractionalBits)
+    func unpack(_ index: Int, converter: CoordinateConverter? = nil) -> UnpackedGaussian {
+        at(index).unpack(usesFloat16: usesFloat16, fractionalBits: fractionalBits, converter: converter)
     }
 }
 
@@ -370,111 +371,34 @@ private func prefetchNextChunk(_ data: UnsafePointer<UInt8>, offset: Int, size: 
 }
 
 private func unpackColorsVectorized(_ packed: PackedGaussians) -> [Float] {
-    let count = packed.numPoints
-    
-    // Create input matrix from packed colors
+    // Convert UInt8 to Float
     let inputs = packed.colors.map { Float($0) }
     
-    return batchMatrixOperation(
-        inputs: inputs,
-        inputRows: count,
-        inputCols: 3
-    ) { matrix, commandBuffer in
-        let scale = MPSMatrixScale(device: device, 
-                                 alpha: 1.0 / (255.0 * colorScale), 
-                                 beta: -0.5 / colorScale)
-        scale.encode(commandBuffer: commandBuffer, inputMatrix: matrix, resultMatrix: matrix)
-    } ?? {
-        // Fallback to CPU implementation
-        var result = [Float](repeating: 0, count: count * 3)
-        for i in 0..<(count * 3) {
-            result[i] = (Float(packed.colors[i]) / 255.0 - 0.5) / colorScale
-        }
-        return result
-    }()
+    // Apply scaling and offset directly
+    return scaleMatrix(inputs, scale: 1.0 / (255.0 * colorScale), offset: -0.5 / colorScale)
 }
 
 private func unpackScalesVectorized(_ packed: PackedGaussians) -> [Float] {
-    let count = packed.numPoints
-    
-    // Create input matrix from packed scales
+    // Convert UInt8 to Float
     let inputs = packed.scales.map { Float($0) }
     
-    return batchMatrixOperation(
-        inputs: inputs,
-        inputRows: count,
-        inputCols: 3
-    ) { matrix, commandBuffer in
-        let scale = MPSMatrixScale(device: device, 
-                                 alpha: 1.0 / 16.0, 
-                                 beta: -10.0)
-        scale.encode(commandBuffer: commandBuffer, inputMatrix: matrix, resultMatrix: matrix)
-    } ?? {
-        // Fallback to CPU implementation
-        var result = [Float](repeating: 0, count: count * 3)
-        for i in 0..<(count * 3) {
-            result[i] = Float(packed.scales[i]) / 16.0 - 10.0
-        }
-        return result
-    }()
+    // Apply scaling and offset directly
+    return scaleMatrix(inputs, scale: 1.0 / 16.0, offset: -10.0)
 }
 
 private func unpackAlphasVectorized(_ packed: PackedGaussians) -> [Float] {
     let count = packed.numPoints
     
-    // Create input matrix from packed alphas
-    let inputs = packed.alphas.map { Float($0) }
+    // Convert to [0,1] range
+    let inputs = packed.alphas.map { Float($0) / 255.0 }
     
-    return batchMatrixOperation(
-        inputs: inputs,
-        inputRows: count,
-        inputCols: 1
-    ) { matrix, commandBuffer in
-        // First scale to [0,1]
-        let scale = MPSMatrixScale(device: device, alpha: 1.0 / 255.0)
-        scale.encode(commandBuffer: commandBuffer, inputMatrix: matrix, resultMatrix: matrix)
-        
-        // Then apply inverse sigmoid using a compute pipeline
-        let library = device.makeDefaultLibrary()
-        let function = library?.makeFunction(name: "invSigmoid")
-        let pipeline = try? device.makeComputePipelineState(function: function!)
-        
-        guard let pipeline = pipeline,
-              let encoder = commandBuffer.makeComputeCommandEncoder() else {
-            return
-        }
-        
-        encoder.setComputePipelineState(pipeline)
-        encoder.setBuffer(matrix.data, offset: 0, index: 0)
-        
-        let threadsPerGroup = pipeline.maxTotalThreadsPerThreadgroup
-        let threadGroups = (count + threadsPerGroup - 1) / threadsPerGroup
-        
-        encoder.dispatchThreadgroups(MTLSize(width: threadGroups, height: 1, depth: 1),
-                                   threadsPerThreadgroup: MTLSize(width: threadsPerGroup, height: 1, depth: 1))
-        encoder.endEncoding()
-    } ?? {
-        // Fallback to CPU implementation
-        var result = [Float](repeating: 0, count: count)
-        for i in 0..<count {
-            result[i] = invSigmoid(Float(packed.alphas[i]) / 255.0)
-        }
-        return result
-    }()
+    // Apply inverse sigmoid directly
+    var result = [Float](repeating: 0, count: count)
+    for i in 0..<count {
+        let x = max(0.0001, min(0.9999, inputs[i]))
+        result[i] = log(x / (1.0 - x))
+    }
+    return result
 }
 
-// Add the inverse sigmoid Metal shader:
-#if os(macOS)
-let invSigmoidShader = """
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void invSigmoid(
-    device float* data [[buffer(0)]],
-    uint id [[thread_position_in_grid]]
-) {
-    float x = data[id];
-    data[id] = log(x / (1.0 - x));
-}
-"""
-#endif
+// We're using the module-wide helper functions and constants

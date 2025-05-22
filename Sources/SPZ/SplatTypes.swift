@@ -54,42 +54,46 @@ public struct GaussianCloud {
     /// Creates an empty gaussian cloud
     public init() {}
     
+    /// Converts between two coordinate systems, for example from RDF (ply format) to RUB (used by spz).
+    /// This is performed in-place.
+    public mutating func convertCoordinates(from: CoordinateSystem, to: CoordinateSystem) {
+        let c = coordinateConverter(from: from, to: to)
+        
+        // Transform positions
+        for i in stride(from: 0, to: positions.count, by: 3) {
+            positions[i + 0] *= c.flipP.x
+            positions[i + 1] *= c.flipP.y
+            positions[i + 2] *= c.flipP.z
+        }
+        
+        // Transform rotations
+        for i in stride(from: 0, to: rotations.count, by: 4) {
+            rotations[i + 0] *= c.flipQ.x
+            rotations[i + 1] *= c.flipQ.y
+            rotations[i + 2] *= c.flipQ.z
+            // w component is never flipped
+        }
+        
+        // Transform spherical harmonics by flipping coefficients according to the conversion rules
+        let numCoeffs = sh.count / 3
+        let numCoeffsPerPoint = numCoeffs / numPoints
+        var idx = 0
+        for _ in stride(from: 0, to: numCoeffs, by: numCoeffsPerPoint) {
+            for j in 0..<numCoeffsPerPoint {
+                guard j < c.flipSh.count else { break }
+                let flip = c.flipSh[j]
+                sh[idx + 0] *= flip
+                sh[idx + 1] *= flip
+                sh[idx + 2] *= flip
+                idx += 3
+            }
+        }
+    }
+    
     /// Rotates the GaussianCloud by 180 degrees about the x axis (converts from RUB to RDF coordinates
     /// and vice versa). This is performed in-place.
     public mutating func rotate180DegAboutX() {
-        // Rotate positions
-        for i in stride(from: 0, to: positions.count, by: 3) {
-            positions[i + 1] = -positions[i + 1]
-            positions[i + 2] = -positions[i + 2]
-        }
-        
-        // Rotate quaternions
-        for i in stride(from: 0, to: rotations.count, by: 4) {
-            let x = rotations[i]
-            let y = rotations[i + 1]
-            let z = rotations[i + 2]
-            let w = rotations[i + 3]
-            let s: Float = x < 0.0 ? -1.0 : 1.0
-            rotations[i] = -s * w
-            rotations[i + 1] = s * z
-            rotations[i + 2] = -s * y
-            rotations[i + 3] = s * x
-        }
-        
-        // Rotate spherical harmonics
-        let coeffsToInvert: [Int] = [0, 1, 3, 6, 8, 10, 11, 13]
-        let numCoeffs = sh.count / 3
-        let numCoeffsPerPoint = numCoeffs / numPoints
-        
-        for i in stride(from: 0, to: numCoeffs, by: numCoeffsPerPoint) {
-            for j in coeffsToInvert {
-                guard j < numCoeffsPerPoint else { break }
-                let idx = (i + j) * 3
-                sh[idx + 0] = -sh[idx + 0]
-                sh[idx + 1] = -sh[idx + 1]
-                sh[idx + 2] = -sh[idx + 2]
-            }
-        }
+        convertCoordinates(from: .rub, to: .rdf)
     }
     
     /// Calculates the median volume of all gaussians in the cloud.
@@ -119,3 +123,25 @@ public typealias Vec3f = SIMD3<Float>
 
 /// Quaternion type (w, x, y, z) using SIMD for efficient calculations
 public typealias Quat4f = SIMD4<Float>
+
+// MARK: - Coordinate Systems
+
+/// Represents different coordinate systems used in 3D graphics
+public enum CoordinateSystem: Int {
+    case unspecified = 0
+    case ldb = 1  // Left Down Back
+    case rdb = 2  // Right Down Back
+    case lub = 3  // Left Up Back
+    case rub = 4  // Right Up Back, Three.js coordinate system
+    case ldf = 5  // Left Down Front
+    case rdf = 6  // Right Down Front, PLY coordinate system
+    case luf = 7  // Left Up Front, GLB coordinate system
+    case ruf = 8  // Right Up Front, Unity coordinate system
+}
+
+/// Converts coordinates between different coordinate systems
+public struct CoordinateConverter {
+    public var flipP: Vec3f = Vec3f(1.0, 1.0, 1.0)  // x, y, z flips
+    public var flipQ: Vec3f = Vec3f(1.0, 1.0, 1.0)  // x, y, z flips, w is never flipped
+    public var flipSh: [Float] = Array(repeating: 1.0, count: 15)  // Flips for SH coefficients
+}

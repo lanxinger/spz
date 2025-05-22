@@ -2,7 +2,7 @@ import Foundation
 
 extension GaussianCloud {
     /// Loads a gaussian cloud from a PLY file
-    public static func loadFromPly(url: URL) throws -> GaussianCloud {
+    public static func loadFromPly(url: URL, to coordinateSystem: CoordinateSystem = .unspecified) throws -> GaussianCloud {
         print("[SPZ] Loading: \(url.path)")
         
         // First try to read the header as text
@@ -218,12 +218,17 @@ extension GaussianCloud {
             }
         }
         
+        // Convert coordinates if needed (PLY is in RDF coordinate system)
+        if coordinateSystem != .unspecified {
+            result.convertCoordinates(from: .rdf, to: coordinateSystem)
+        }
+        
         print("\r[SPZ] Loading complete: \(numPoints) points")  // Clear progress line with final message
         return result
     }
     
     /// Saves the gaussian cloud to a PLY file
-    public func saveToPly(url: URL) throws {
+    public func saveToPly(url: URL, from coordinateSystem: CoordinateSystem = .unspecified) throws {
         let N = numPoints
         let shDim = sh.count / (N * 3)
         let D = 17 + shDim * 3
@@ -237,6 +242,12 @@ extension GaussianCloud {
               alphas.count == N,
               colors.count == N * 3 else {
             throw SPZError.invalidData
+        }
+        
+        // Create a copy for coordinate conversion if needed
+        var cloudToConvert = self
+        if coordinateSystem != .unspecified {
+            cloudToConvert.convertCoordinates(from: coordinateSystem, to: .rdf)
         }
         
         var values = Array(repeating: Float(0), count: N * D)
@@ -258,42 +269,42 @@ extension GaussianCloud {
             let i4 = i * 4
             
             // Position (x, y, z)
-            values[outIdx] = positions[i3]; outIdx += 1
-            values[outIdx] = positions[i3 + 1]; outIdx += 1
-            values[outIdx] = positions[i3 + 2]; outIdx += 1
+            values[outIdx] = cloudToConvert.positions[i3]; outIdx += 1
+            values[outIdx] = cloudToConvert.positions[i3 + 1]; outIdx += 1
+            values[outIdx] = cloudToConvert.positions[i3 + 2]; outIdx += 1
             
             // Normals (nx, ny, nz) - always zero
             outIdx += 3
             
             // Color (r, g, b)
-            values[outIdx] = colors[i3]; outIdx += 1
-            values[outIdx] = colors[i3 + 1]; outIdx += 1
-            values[outIdx] = colors[i3 + 2]; outIdx += 1
+            values[outIdx] = cloudToConvert.colors[i3]; outIdx += 1
+            values[outIdx] = cloudToConvert.colors[i3 + 1]; outIdx += 1
+            values[outIdx] = cloudToConvert.colors[i3 + 2]; outIdx += 1
             
             // Spherical harmonics
             for j in 0..<shDim {
-                values[outIdx] = sh[(i * shDim + j) * 3]; outIdx += 1
+                values[outIdx] = cloudToConvert.sh[(i * shDim + j) * 3]; outIdx += 1
             }
             for j in 0..<shDim {
-                values[outIdx] = sh[(i * shDim + j) * 3 + 1]; outIdx += 1
+                values[outIdx] = cloudToConvert.sh[(i * shDim + j) * 3 + 1]; outIdx += 1
             }
             for j in 0..<shDim {
-                values[outIdx] = sh[(i * shDim + j) * 3 + 2]; outIdx += 1
+                values[outIdx] = cloudToConvert.sh[(i * shDim + j) * 3 + 2]; outIdx += 1
             }
             
             // Alpha
-            values[outIdx] = alphas[i]; outIdx += 1
+            values[outIdx] = cloudToConvert.alphas[i]; outIdx += 1
             
             // Scale
-            values[outIdx] = scales[i3]; outIdx += 1
-            values[outIdx] = scales[i3 + 1]; outIdx += 1
-            values[outIdx] = scales[i3 + 2]; outIdx += 1
+            values[outIdx] = cloudToConvert.scales[i3]; outIdx += 1
+            values[outIdx] = cloudToConvert.scales[i3 + 1]; outIdx += 1
+            values[outIdx] = cloudToConvert.scales[i3 + 2]; outIdx += 1
             
             // Rotation
-            values[outIdx] = rotations[i4 + 3]; outIdx += 1  // w
-            values[outIdx] = rotations[i4]; outIdx += 1      // x
-            values[outIdx] = rotations[i4 + 1]; outIdx += 1  // y
-            values[outIdx] = rotations[i4 + 2]; outIdx += 1  // z
+            values[outIdx] = cloudToConvert.rotations[i4 + 3]; outIdx += 1  // w
+            values[outIdx] = cloudToConvert.rotations[i4]; outIdx += 1      // x
+            values[outIdx] = cloudToConvert.rotations[i4 + 1]; outIdx += 1  // y
+            values[outIdx] = cloudToConvert.rotations[i4 + 2]; outIdx += 1  // z
         }
         
         // Write header

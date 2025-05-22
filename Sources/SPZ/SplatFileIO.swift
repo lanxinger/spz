@@ -223,8 +223,8 @@ extension PackedGaussians {
 public extension GaussianCloud {
     
     /// Saves the gaussian cloud to a compressed SPZ file
-    static func save(_ cloud: GaussianCloud, to url: URL) throws {
-        let packed = packGaussians(cloud)
+    static func save(_ cloud: GaussianCloud, to url: URL, from coordinateSystem: CoordinateSystem = .unspecified) throws {
+        let packed = packGaussians(cloud, from: coordinateSystem)
         let serialized = packed.serialize()
         
         // Create gzip header
@@ -317,19 +317,19 @@ public extension GaussianCloud {
     }
     
     /// Loads a gaussian cloud from a compressed SPZ file
-    static func load(from url: URL) throws -> GaussianCloud {
+    static func load(from url: URL, to coordinateSystem: CoordinateSystem = .unspecified) throws -> GaussianCloud {
         let data = try Data(contentsOf: url)
         guard let decompressed = decompressGzipped(data) else {
             throw SPZError.decompressionError
         }
         let packed = try PackedGaussians.deserialize(decompressed)
-        return unpackGaussians(packed)
+        return unpackGaussians(packed, to: coordinateSystem)
     }
 }
 
 // MARK: - Private Helpers
 
-public func unpackGaussians(_ packed: PackedGaussians) -> GaussianCloud {
+public func unpackGaussians(_ packed: PackedGaussians, to coordinateSystem: CoordinateSystem = .unspecified) -> GaussianCloud {
     let numPoints = packed.numPoints
     let shDim = dimForDegree(packed.shDegree)
     let usesFloat16 = packed.usesFloat16
@@ -354,38 +354,66 @@ public func unpackGaussians(_ packed: PackedGaussians) -> GaussianCloud {
     
     print("[SPZ] Unpacking \(numPoints) points with SH degree \(packed.shDegree)")
     
-    // Progress tracking
-    let progressInterval = max(1, numPoints / 100)  // Update every 1%
-    var lastProgress = 0
+    // Create coordinate converter if needed
+    let converter = coordinateSystem != .unspecified ? 
+        coordinateConverter(from: .rub, to: coordinateSystem) : nil
     
-    if usesFloat16 {
-        // Decode legacy float16 format
+    // Process points with batch operations where possible
+    // For positions, we use either a vectorized approach or a more cache-friendly one
+    // depending on the data format
+    
+    if numPoints > 10000 {
+        // For large point sets, use optimized unpacking
+        if usesFloat16 {
+            result.positions = unpackPositionsVectorized(packed)
+        } else {
+            processPointsByCacheLine(packed, result: &result)
+        }
+        
+        // CPU fallbacks for the other components
         for i in 0..<numPoints {
-            // Update progress
-            let progress = (i * 100) / numPoints
-            if progress != lastProgress && i % progressInterval == 0 {
-                print("\r[SPZ] Unpacking progress: \(progress)%", terminator: "")
-                fflush(stdout)
-                lastProgress = progress
+            let i3 = i * 3
+            
+            // Scales
+            for j in 0..<3 {
+                result.scales[i3 + j] = Float(packed.scales[i3 + j]) / 16.0 - 10.0
             }
             
-            let baseIdx = i * 6  // 2 bytes per component, 3 components
-            guard baseIdx + 5 < packed.positions.count else {
-                print("[SPZ] Error: Position data out of bounds at point \(i)")
-                return result
+            // Colors
+            for j in 0..<3 {
+                result.colors[i3 + j] = (Float(packed.colors[i3 + j]) / 255.0 - 0.5) / colorScale
             }
             
-            let x = UInt16(packed.positions[baseIdx]) | (UInt16(packed.positions[baseIdx + 1]) << 8)
-            let y = UInt16(packed.positions[baseIdx + 2]) | (UInt16(packed.positions[baseIdx + 3]) << 8)
-            let z = UInt16(packed.positions[baseIdx + 4]) | (UInt16(packed.positions[baseIdx + 5]) << 8)
+            // Alpha
+            result.alphas[i] = invSigmoid(Float(packed.alphas[i]) / 255.0)
             
-            result.positions[i * 3 + 0] = float16ToFloat32(x)
-            result.positions[i * 3 + 1] = float16ToFloat32(y)
-            result.positions[i * 3 + 2] = float16ToFloat32(z)
+            // Rotation
+            let i4 = i * 4
+            let xyz = Vec3f(
+                Float(packed.rotations[i3 + 0]),
+                Float(packed.rotations[i3 + 1]),
+                Float(packed.rotations[i3 + 2])
+            ) / 127.5 - Vec3f(1, 1, 1)
+            
+            result.rotations[i4 + 0] = xyz.x
+            result.rotations[i4 + 1] = xyz.y
+            result.rotations[i4 + 2] = xyz.z
+            result.rotations[i4 + 3] = sqrt(max(0.0, 1.0 - xyz.squaredNorm))
+            
+            // SH
+            let shStride = shDim * 3
+            let shOffset = i * shStride
+            for j in 0..<shStride {
+                if j < packed.sh.count {
+                    result.sh[shOffset + j] = unquantizeSH(packed.sh[shOffset + j])
+                }
+            }
         }
     } else {
-        // Decode 24-bit fixed point coordinates
-        let scale = 1.0 / Float(1 << packed.fractionalBits)
+        // For smaller point sets, use the standard approach
+        let progressInterval = max(1, numPoints / 100)  // Update every 1%
+        var lastProgress = 0
+        
         for i in 0..<numPoints {
             // Update progress
             let progress = (i * 100) / numPoints
@@ -395,97 +423,53 @@ public func unpackGaussians(_ packed: PackedGaussians) -> GaussianCloud {
                 lastProgress = progress
             }
             
-            let baseIdx = i * 9  // 3 bytes per component, 3 components
-            guard baseIdx + 8 < packed.positions.count else {
-                print("[SPZ] Error: Position data out of bounds at point \(i)")
-                return result
-            }
+            // Unpack each gaussian using the at() method
+            let unpacked = packed.unpack(i, converter: converter)
             
-            for j in 0..<3 {
-                let idx = baseIdx + j * 3
-                var fixed32: Int32 = Int32(packed.positions[idx])
-                fixed32 |= Int32(packed.positions[idx + 1]) << 8
-                fixed32 |= Int32(packed.positions[idx + 2]) << 16
-                if (fixed32 & 0x800000) != 0 {
-                    fixed32 |= Int32(bitPattern: 0xFF000000)
-                }
-                result.positions[i * 3 + j] = Float(fixed32) * scale
+            // Copy data to result
+            let i3 = i * 3
+            let i4 = i * 4
+            
+            result.positions[i3..<(i3+3)] = [unpacked.position.x, unpacked.position.y, unpacked.position.z]
+            result.scales[i3..<(i3+3)] = [unpacked.scale.x, unpacked.scale.y, unpacked.scale.z]
+            result.rotations[i4..<(i4+4)] = [unpacked.rotation.x, unpacked.rotation.y, unpacked.rotation.z, unpacked.rotation.w]
+            result.alphas[i] = unpacked.alpha
+            result.colors[i3..<(i3+3)] = [unpacked.color.x, unpacked.color.y, unpacked.color.z]
+            
+            // Copy SH coefficients
+            let shStride = shDim * 3
+            let shOffset = i * shStride
+            
+            for j in 0..<shDim {
+                result.sh[shOffset + j * 3 + 0] = unpacked.shR[j]
+                result.sh[shOffset + j * 3 + 1] = unpacked.shG[j]
+                result.sh[shOffset + j * 3 + 2] = unpacked.shB[j]
             }
         }
     }
     
-    // Unpack scales
-    for i in 0..<numPoints {
-        guard i * 3 + 2 < packed.scales.count else {
-            print("[SPZ] Error: Scale data out of bounds at point \(i)")
-            return result
-        }
-        for j in 0..<3 {
-            result.scales[i * 3 + j] = Float(packed.scales[i * 3 + j]) / 16.0 - 10.0
-        }
-    }
-    
-    // Unpack rotations
-    for i in 0..<numPoints {
-        guard i * 3 + 2 < packed.rotations.count else {
-            print("[SPZ] Error: Rotation data out of bounds at point \(i)")
-            return result
-        }
-        let xyz = Vec3f(
-            Float(packed.rotations[i * 3 + 0]),
-            Float(packed.rotations[i * 3 + 1]),
-            Float(packed.rotations[i * 3 + 2])
-        ) / 127.5 - Vec3f(1, 1, 1)
-        
-        result.rotations[i * 4 + 0] = xyz.x
-        result.rotations[i * 4 + 1] = xyz.y
-        result.rotations[i * 4 + 2] = xyz.z
-        result.rotations[i * 4 + 3] = sqrt(max(0.0, 1.0 - xyz.squaredNorm))
-    }
-    
-    // Unpack alphas
-    for i in 0..<numPoints {
-        guard i < packed.alphas.count else {
-            print("[SPZ] Error: Alpha data out of bounds at point \(i)")
-            return result
-        }
-        result.alphas[i] = invSigmoid(Float(packed.alphas[i]) / 255.0)
-    }
-    
-    // Unpack colors
-    for i in 0..<numPoints {
-        guard i * 3 + 2 < packed.colors.count else {
-            print("[SPZ] Error: Color data out of bounds at point \(i)")
-            return result
-        }
-        for j in 0..<3 {
-            result.colors[i * 3 + j] = (Float(packed.colors[i * 3 + j]) / 255.0 - 0.5) / colorScale
-        }
-    }
-    
-    // Unpack spherical harmonics
-    let shStride = shDim * 3
-    for i in 0..<numPoints {
-        guard i * shStride + shStride - 1 < packed.sh.count else {
-            print("[SPZ] Error: SH data out of bounds at point \(i)")
-            return result
-        }
-        for j in 0..<shStride {
-            result.sh[i * shStride + j] = unquantizeSH(packed.sh[i * shStride + j])
-        }
+    // If we used the optimized approach, apply coordinate transformation after the fact
+    if numPoints > 10000 && coordinateSystem != .unspecified {
+        result.convertCoordinates(from: .rub, to: coordinateSystem)
     }
     
     print("\r[SPZ] Unpacking complete: \(numPoints) points")
     return result
 }
 
-private func packGaussians(_ cloud: GaussianCloud) -> PackedGaussians {
+private func packGaussians(_ cloud: GaussianCloud, from coordinateSystem: CoordinateSystem = .unspecified) -> PackedGaussians {
     guard checkSizes(cloud) else {
         return PackedGaussians()
     }
     
     let numPoints = cloud.numPoints
     let shDim = dimForDegree(cloud.shDegree)
+    
+    // Convert coordinate system if needed
+    var cloudToConvert = cloud
+    if coordinateSystem != .unspecified {
+        cloudToConvert.convertCoordinates(from: coordinateSystem, to: .rub)
+    }
     
     // Use 12 bits for the fractional part of coordinates (~0.25 millimeter resolution)
     var packed = PackedGaussians()
@@ -505,7 +489,10 @@ private func packGaussians(_ cloud: GaussianCloud) -> PackedGaussians {
     // Store coordinates as 24-bit fixed point values
     let scale = Float(1 << packed.fractionalBits)
     for i in 0..<numPoints * 3 {
-        let fixed32 = Int32(round(cloud.positions[i] * scale))
+        let posValue = cloudToConvert.positions[i]
+        // Check for NaN or infinity values and replace with a safe value
+        let safeValue = posValue.isFinite ? posValue : 0.0
+        let fixed32 = Int32(round(safeValue * scale))
         packed.positions[i * 3 + 0] = UInt8(fixed32 & 0xff)
         packed.positions[i * 3 + 1] = UInt8((fixed32 >> 8) & 0xff)
         packed.positions[i * 3 + 2] = UInt8((fixed32 >> 16) & 0xff)
@@ -513,17 +500,19 @@ private func packGaussians(_ cloud: GaussianCloud) -> PackedGaussians {
     
     // Pack scales
     for i in 0..<numPoints * 3 {
-        packed.scales[i] = toUInt8((cloud.scales[i] + 10.0) * 16.0)
+        let scaleValue = cloudToConvert.scales[i]
+        let safeValue = scaleValue.isFinite ? scaleValue : 0.0
+        packed.scales[i] = toUInt8((safeValue + 10.0) * 16.0)
     }
     
     // Pack rotations
     for i in 0..<numPoints {
         // Normalize the quaternion, make w positive, then store xyz
         var q = Quat4f(
-            cloud.rotations[i * 4 + 0],
-            cloud.rotations[i * 4 + 1],
-            cloud.rotations[i * 4 + 2],
-            cloud.rotations[i * 4 + 3]
+            cloudToConvert.rotations[i * 4 + 0].isFinite ? cloudToConvert.rotations[i * 4 + 0] : 0.0,
+            cloudToConvert.rotations[i * 4 + 1].isFinite ? cloudToConvert.rotations[i * 4 + 1] : 0.0,
+            cloudToConvert.rotations[i * 4 + 2].isFinite ? cloudToConvert.rotations[i * 4 + 2] : 0.0,
+            cloudToConvert.rotations[i * 4 + 3].isFinite ? cloudToConvert.rotations[i * 4 + 3] : 1.0
         ).normalized
         
         // Make w positive
@@ -537,12 +526,16 @@ private func packGaussians(_ cloud: GaussianCloud) -> PackedGaussians {
     
     // Pack alphas
     for i in 0..<numPoints {
-        packed.alphas[i] = toUInt8(sigmoid(cloud.alphas[i]) * 255.0)
+        let alphaValue = cloudToConvert.alphas[i]
+        let safeValue = alphaValue.isFinite ? alphaValue : 0.0
+        packed.alphas[i] = toUInt8(sigmoid(safeValue) * 255.0)
     }
     
     // Pack colors
     for i in 0..<numPoints * 3 {
-        packed.colors[i] = toUInt8(cloud.colors[i] * (colorScale * 255.0) + (0.5 * 255.0))
+        let colorValue = cloudToConvert.colors[i]
+        let safeValue = colorValue.isFinite ? colorValue : 0.0
+        packed.colors[i] = toUInt8(safeValue * (colorScale * 255.0) + (0.5 * 255.0))
     }
     
     // Pack spherical harmonics
@@ -556,11 +549,15 @@ private func packGaussians(_ cloud: GaussianCloud) -> PackedGaussians {
             var j = 0
             // There are 9 coefficients for degree 1
             while j < 9 {
-                packed.sh[i + j] = quantizeSH(cloud.sh[i + j], bucketSize: 1 << (8 - sh1Bits))
+                let shValue = cloudToConvert.sh[i + j]
+                let safeValue = shValue.isFinite ? shValue : 0.0
+                packed.sh[i + j] = quantizeSH(safeValue, bucketSize: 1 << (8 - sh1Bits))
                 j += 1
             }
             while j < shPerPoint {
-                packed.sh[i + j] = quantizeSH(cloud.sh[i + j], bucketSize: 1 << (8 - shRestBits))
+                let shValue = cloudToConvert.sh[i + j]
+                let safeValue = shValue.isFinite ? shValue : 0.0
+                packed.sh[i + j] = quantizeSH(safeValue, bucketSize: 1 << (8 - shRestBits))
                 j += 1
             }
         }
@@ -617,171 +614,112 @@ private func checkSizes(_ packed: PackedGaussians, numPoints: Int, shDim: Int, u
     return true
 }
 
-// Use block copy operations for arrays
-private func copyArrays(from source: PackedGaussians, to destination: inout GaussianCloud) {
-    let count = source.numPoints
-    
-    // Copy alphas using unsafe buffers
-    source.alphas.withUnsafeBufferPointer { srcBuf in
-        destination.alphas.withUnsafeMutableBufferPointer { dstBuf in
-            guard let srcPtr = srcBuf.baseAddress,
-                  let dstPtr = dstBuf.baseAddress else { return }
-            // Convert UInt8 to Float while copying
-            for i in 0..<count {
-                dstPtr[i] = Float(srcPtr[i])
-            }
-        }
-    }
-    
-    // Copy positions
-    source.positions.withUnsafeBufferPointer { srcBuf in
-        destination.positions.withUnsafeMutableBufferPointer { dstBuf in
-            guard let srcPtr = srcBuf.baseAddress,
-                  let dstPtr = dstBuf.baseAddress else { return }
-            // Handle position conversion based on format
-            if source.usesFloat16 {
-                for i in 0..<count {
-                    let baseIn = i * 6  // 2 bytes per component
-                    let baseOut = i * 3
-                    for j in 0..<3 {
-                        let halfValue = UInt16(srcPtr[baseIn + j * 2]) |
-                                      (UInt16(srcPtr[baseIn + j * 2 + 1]) << 8)
-                        dstPtr[baseOut + j] = float16ToFloat32(halfValue)
-                    }
-                }
-            } else {
-                let scale = 1.0 / Float(1 << source.fractionalBits)
-                for i in 0..<count {
-                    let baseIn = i * 9  // 3 bytes per component
-                    let baseOut = i * 3
-                    for j in 0..<3 {
-                        var fixed32: Int32 = Int32(srcPtr[baseIn + j * 3])
-                        fixed32 |= Int32(srcPtr[baseIn + j * 3 + 1]) << 8
-                        fixed32 |= Int32(srcPtr[baseIn + j * 3 + 2]) << 16
-                        if (fixed32 & 0x800000) != 0 {
-                            fixed32 |= Int32(bitPattern: 0xFF000000)
-                        }
-                        dstPtr[baseOut + j] = Float(fixed32) * scale
-                    }
-                }
-            }
-        }
-    }
-}
+// MARK: - Vectorized Unpacking Functions
 
-// Use DispatchQueue for parallel processing of large point sets
-private func processPointsInParallel(packed: PackedGaussians, result: inout GaussianCloud) {
-    let pointsPerThread = 1000
-    let threadCount = (packed.numPoints + pointsPerThread - 1) / pointsPerThread
+/// Unpacks positions using vectorized operations for better performance
+private func unpackPositionsVectorized(_ packed: PackedGaussians) -> [Float] {
+    let count = packed.numPoints
+    var result = [Float](repeating: 0, count: count * 3)
     
-    // Create a temporary array to store results from each thread
-    var threadResults = [(Range<Int>, [Float])](repeating: (0..<0, []), count: threadCount)
-    
-    DispatchQueue.concurrentPerform(iterations: threadCount) { threadIndex in
-        let start = threadIndex * pointsPerThread
-        let end = min(start + pointsPerThread, packed.numPoints)
-        var localResult = [Float](repeating: 0, count: (end - start) * 3)
+    if packed.usesFloat16 {
+        // Process positions in chunks for float16 format
+        let chunkSize = 4 // Process 4 positions at a time when possible
+        let fullChunks = count / chunkSize
         
-        // Process points in this range
-        for i in start..<end {
-            let localIndex = (i - start) * 3
-            if packed.usesFloat16 {
-                // Process float16 positions
-                let baseIdx = i * 6
+        for chunk in 0..<fullChunks {
+            let baseIdx = chunk * chunkSize
+            let sourceIdx = baseIdx * 6 // 2 bytes per component, 3 components
+            
+            // Process each component for the chunk
+            for i in 0..<chunkSize {
+                let pos = baseIdx + i
                 for j in 0..<3 {
-                    let halfValue = UInt16(packed.positions[baseIdx + j * 2]) |
-                                  (UInt16(packed.positions[baseIdx + j * 2 + 1]) << 8)
-                    localResult[localIndex + j] = float16ToFloat32(halfValue)
+                    let idx = sourceIdx + i * 6 + j * 2
+                    guard idx + 1 < packed.positions.count else { continue }
+                    
+                    let halfValue = UInt16(packed.positions[idx]) | (UInt16(packed.positions[idx + 1]) << 8)
+                    result[pos * 3 + j] = float16ToFloat32(halfValue)
                 }
-            } else {
-                // Process fixed-point positions
-                let baseIdx = i * 9
-                let scale = 1.0 / Float(1 << packed.fractionalBits)
+            }
+        }
+        
+        // Handle remaining positions
+        for i in (fullChunks * chunkSize)..<count {
+            let sourceIdx = i * 6
+            for j in 0..<3 {
+                let idx = sourceIdx + j * 2
+                guard idx + 1 < packed.positions.count else { continue }
+                
+                let halfValue = UInt16(packed.positions[idx]) | (UInt16(packed.positions[idx + 1]) << 8)
+                result[i * 3 + j] = float16ToFloat32(halfValue)
+            }
+        }
+    } else {
+        // Process fixed-point positions
+        let scale = 1.0 / Float(1 << packed.fractionalBits)
+        let chunkSize = 4 // Process 4 positions at a time when possible
+        let fullChunks = count / chunkSize
+        
+        for chunk in 0..<fullChunks {
+            let baseIdx = chunk * chunkSize
+            let sourceIdx = baseIdx * 9 // 3 bytes per component, 3 components
+            
+            // Process each component for the chunk
+            for i in 0..<chunkSize {
+                let pos = baseIdx + i
                 for j in 0..<3 {
-                    var fixed32: Int32 = Int32(packed.positions[baseIdx + j * 3])
-                    fixed32 |= Int32(packed.positions[baseIdx + j * 3 + 1]) << 8
-                    fixed32 |= Int32(packed.positions[baseIdx + j * 3 + 2]) << 16
+                    let idx = sourceIdx + i * 9 + j * 3
+                    guard idx + 2 < packed.positions.count else { continue }
+                    
+                    var fixed32: Int32 = Int32(packed.positions[idx])
+                    fixed32 |= Int32(packed.positions[idx + 1]) << 8
+                    fixed32 |= Int32(packed.positions[idx + 2]) << 16
                     if (fixed32 & 0x800000) != 0 {
-                        fixed32 |= Int32(bitPattern: 0xFF000000)
+                        fixed32 |= Int32(bitPattern: 0xFF000000) // Sign extension
                     }
-                    localResult[localIndex + j] = Float(fixed32) * scale
+                    result[pos * 3 + j] = Float(fixed32) * scale
                 }
             }
         }
         
-        threadResults[threadIndex] = (start..<end, localResult)
-    }
-    
-    // Combine results from all threads
-    for (range, localResult) in threadResults {
-        let destStart = range.startIndex * 3
-        let count = range.count * 3
-        result.positions.replaceSubrange(destStart..<(destStart + count), with: localResult)
-    }
-}
-
-private func processSHBatch(_ cloud: GaussianCloud, startIdx: Int, count: Int) -> [UInt8] {
-    let shDim = dimForDegree(cloud.shDegree)
-    let sh1Bits = 5
-    let shRestBits = 4
-    var result = [UInt8](repeating: 0, count: count * shDim * 3)
-    
-    // Process 4 coefficients at a time using SIMD
-    let simdCount = (count * shDim * 3) / 4 * 4
-    let source = cloud.sh
-    
-    for i in stride(from: 0, to: simdCount, by: 4) {
-        let values = SIMD4<Float>(
-            source[startIdx + i],
-            source[startIdx + i + 1],
-            source[startIdx + i + 2],
-            source[startIdx + i + 3]
-        )
-        
-        let bucketSize: Float = i < (9 * count) ? Float(1 << (8 - sh1Bits)) : Float(1 << (8 - shRestBits))
-        let bucketSizeVec = SIMD4<Float>(repeating: bucketSize)
-        
-        // Quantize values
-        let quantized = values * 128.0 + SIMD4<Float>(repeating: 128.0)
-        let rounded = quantized.rounded(.toNearestOrAwayFromZero)
-        let halfBucket = bucketSizeVec * 0.5
-        let bucketed = ((rounded + halfBucket) / bucketSizeVec).rounded(.towardZero) * bucketSizeVec
-        
-        // Manual clamping between 0 and 255
-        let clamped = SIMD4<Float>(
-            max(0, min(255, bucketed[0])),
-            max(0, min(255, bucketed[1])),
-            max(0, min(255, bucketed[2])),
-            max(0, min(255, bucketed[3]))
-        )
-        
-        for j in 0..<4 {
-            result[i + j] = UInt8(clamped[j])
+        // Handle remaining positions
+        for i in (fullChunks * chunkSize)..<count {
+            let sourceIdx = i * 9
+            for j in 0..<3 {
+                let idx = sourceIdx + j * 3
+                guard idx + 2 < packed.positions.count else { continue }
+                
+                var fixed32: Int32 = Int32(packed.positions[idx])
+                fixed32 |= Int32(packed.positions[idx + 1]) << 8
+                fixed32 |= Int32(packed.positions[idx + 2]) << 16
+                if (fixed32 & 0x800000) != 0 {
+                    fixed32 |= Int32(bitPattern: 0xFF000000) // Sign extension
+                }
+                result[i * 3 + j] = Float(fixed32) * scale
+            }
         }
-    }
-    
-    // Handle remaining coefficients
-    for i in simdCount..<(count * shDim * 3) {
-        let bucketSize = i < (9 * count) ? 1 << (8 - sh1Bits) : 1 << (8 - shRestBits)
-        result[i] = quantizeSH(source[startIdx + i], bucketSize: bucketSize)
     }
     
     return result
 }
 
+/// Process points in a cache-line friendly manner
 private func processPointsByCacheLine(_ packed: PackedGaussians, result: inout GaussianCloud) {
     // Process points in cache-line sized chunks (64 bytes typically)
-    let pointsPerCacheLine = 64 / MemoryLayout<Float>.stride
+    let pointsPerCacheLine = 4 // 4 points at a time to match a typical 64-byte cache line
     let count = packed.numPoints
     
     for baseIdx in stride(from: 0, to: count, by: pointsPerCacheLine) {
         let endIdx = min(baseIdx + pointsPerCacheLine, count)
+        
         // Process this cache-line sized chunk of points
         for pointIdx in baseIdx..<endIdx {
             let posIdx = pointIdx * 3
+            
             if packed.usesFloat16 {
                 let baseIn = pointIdx * 6  // 2 bytes per component
                 for j in 0..<3 {
+                    guard baseIn + j * 2 + 1 < packed.positions.count else { continue }
                     let halfValue = UInt16(packed.positions[baseIn + j * 2]) |
                                   (UInt16(packed.positions[baseIn + j * 2 + 1]) << 8)
                     result.positions[posIdx + j] = float16ToFloat32(halfValue)
@@ -790,6 +728,7 @@ private func processPointsByCacheLine(_ packed: PackedGaussians, result: inout G
                 let baseIn = pointIdx * 9  // 3 bytes per component
                 let scale = 1.0 / Float(1 << packed.fractionalBits)
                 for j in 0..<3 {
+                    guard baseIn + j * 3 + 2 < packed.positions.count else { continue }
                     var fixed32: Int32 = Int32(packed.positions[baseIn + j * 3])
                     fixed32 |= Int32(packed.positions[baseIn + j * 3 + 1]) << 8
                     fixed32 |= Int32(packed.positions[baseIn + j * 3 + 2]) << 16
@@ -800,97 +739,5 @@ private func processPointsByCacheLine(_ packed: PackedGaussians, result: inout G
                 }
             }
         }
-    }
-}
-
-private func processSHBatchMPS(_ cloud: GaussianCloud, startIdx: Int, count: Int) -> [UInt8] {
-    // Fall back to CPU implementation if MPS is not available
-    if #available(iOS 10.0, macOS 10.13, *) {
-        let shDim = dimForDegree(cloud.shDegree)
-        let sh1Bits = 5
-        let shRestBits = 4
-        
-        // Create input matrix
-        let source = Array(cloud.sh[startIdx..<(startIdx + count * shDim * 3)])
-        guard let inputMatrix = createMPSMatrix(from: source,
-                                              rows: count,
-                                              columns: shDim * 3) else {
-            return processSHBatch(cloud, startIdx: startIdx, count: count)
-        }
-        
-        // Create scale and bias matrices
-        let scaleData: [Float] = [128.0]
-        let biasData: [Float] = [128.0]
-        
-        guard let scaleMatrix = createMPSMatrix(from: scaleData, rows: 1, columns: 1),
-              let biasMatrix = createMPSMatrix(from: biasData, rows: 1, columns: 1) else {
-            return processSHBatch(cloud, startIdx: startIdx, count: count)
-        }
-        
-        // Create output buffer
-        guard let outputBuffer = device.makeBuffer(length: count * shDim * 3 * MemoryLayout<Float>.stride,
-                                                 options: .storageModeShared) else {
-            return processSHBatch(cloud, startIdx: startIdx, count: count)
-        }
-        
-        let outputDescriptor = MPSMatrixDescriptor(rows: count,
-                                                 columns: shDim * 3,
-                                                 rowBytes: shDim * 3 * MemoryLayout<Float>.stride,
-                                                 dataType: .float32)
-        let outputMatrix = MPSMatrix(buffer: outputBuffer, descriptor: outputDescriptor)
-        
-        // Create command buffer
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
-            return processSHBatch(cloud, startIdx: startIdx, count: count)
-        }
-        
-        // Scale and bias
-        let scaleKernel = MPSMatrixMultiplication(device: device,
-                                                transposeLeft: false,
-                                                transposeRight: false,
-                                                resultRows: count,
-                                                resultColumns: shDim * 3,
-                                                interiorColumns: 1,
-                                                alpha: 1.0,
-                                                beta: 0.0)
-        
-        scaleKernel.encode(commandBuffer: commandBuffer,
-                          leftMatrix: inputMatrix,
-                          rightMatrix: scaleMatrix,
-                          resultMatrix: outputMatrix)
-        
-        // Add bias using a matrix multiplication
-        let biasKernel = MPSMatrixMultiplication(device: device,
-                                               transposeLeft: false,
-                                               transposeRight: false,
-                                               resultRows: count,
-                                               resultColumns: shDim * 3,
-                                               interiorColumns: 1,
-                                               alpha: 1.0,
-                                               beta: 1.0)
-        
-        biasKernel.encode(commandBuffer: commandBuffer,
-                         leftMatrix: outputMatrix,
-                         rightMatrix: biasMatrix,
-                         resultMatrix: outputMatrix)
-        
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        
-        // Convert to UInt8 with bucketing
-        let result = outputBuffer.contents().assumingMemoryBound(to: Float.self)
-        var quantized = [UInt8](repeating: 0, count: count * shDim * 3)
-        
-        for i in 0..<(count * shDim * 3) {
-            let bucketSize = i < (9 * count) ? 1 << (8 - sh1Bits) : 1 << (8 - shRestBits)
-            let value = result[i]
-            let bucketed = ((value + Float(bucketSize) / 2) / Float(bucketSize)).rounded(.down) * Float(bucketSize)
-            quantized[i] = UInt8(max(0, min(255, bucketed)))
-        }
-        
-        return quantized
-    } else {
-        // Fall back to CPU implementation for older OS versions
-        return processSHBatch(cloud, startIdx: startIdx, count: count)
     }
 }

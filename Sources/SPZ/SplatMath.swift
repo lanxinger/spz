@@ -190,3 +190,54 @@ extension GaussianCloud {
         return rotatedVectors
     }
 }
+
+// MARK: - Coordinate System Conversion
+
+/// Returns true if the axes match between two coordinate systems
+private func axesMatch(_ a: CoordinateSystem, _ b: CoordinateSystem) -> (Bool, Bool, Bool) {
+    if a == .unspecified || b == .unspecified {
+        return (true, true, true)
+    }
+    
+    let aNum = a.rawValue - 1
+    let bNum = b.rawValue - 1
+    
+    return (
+        ((aNum >> 0) & 1) == ((bNum >> 0) & 1),
+        ((aNum >> 1) & 1) == ((bNum >> 1) & 1),
+        ((aNum >> 2) & 1) == ((bNum >> 2) & 1)
+    )
+}
+
+/// Creates a coordinate converter between two coordinate systems
+public func coordinateConverter(from: CoordinateSystem, to: CoordinateSystem) -> CoordinateConverter {
+    let (xMatch, yMatch, zMatch) = axesMatch(from, to)
+    let x: Float = xMatch ? 1.0 : -1.0
+    let y: Float = yMatch ? 1.0 : -1.0
+    let z: Float = zMatch ? 1.0 : -1.0
+    
+    var converter = CoordinateConverter()
+    converter.flipP = Vec3f(x, y, z)
+    converter.flipQ = Vec3f(y * z, x * z, x * y)
+    
+    // Flips for the 15 spherical harmonics coefficients
+    converter.flipSh = [
+        y,          // 0
+        z,          // 1
+        x,          // 2
+        x * y,      // 3
+        y * z,      // 4
+        1.0,        // 5
+        x * z,      // 6
+        1.0,        // 7
+        y,          // 8
+        x * y * z,  // 9
+        y,          // 10
+        z,          // 11
+        x,          // 12
+        z,          // 13
+        x           // 14
+    ]
+    
+    return converter
+}
