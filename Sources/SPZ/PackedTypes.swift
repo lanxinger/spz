@@ -110,66 +110,45 @@ public struct PackedGaussian {
         var result = UnpackedGaussian()
         let c = converter ?? CoordinateConverter()
         
-        // Use unsafe buffers for faster access
-        position.withUnsafeBufferPointer { posPtr in
-            rotation.withUnsafeBufferPointer { rotPtr in
-                scale.withUnsafeBufferPointer { scalePtr in
-                    // Unpack position based on format
-                    if usesFloat16 {
-                        guard position.count >= 6 else { return }
-                        
-                        let halfPtr = posPtr.baseAddress!.withMemoryRebound(to: UInt16.self, capacity: 3) { $0 }
-                        for i in 0..<3 {
-                            result.position[i] = c.flipP[i] * float16ToFloat32(halfPtr[i])
-                        }
-                    } else {
-                        guard position.count >= 9 else { return }
-                        
-                        // Decode 24-bit fixed point coordinates
-                        let scale = 1.0 / Float(1 << fractionalBits)
-                        for i in 0..<3 {
-                            var fixed32: Int32 = Int32(position[i * 3])
-                            fixed32 |= Int32(position[i * 3 + 1]) << 8
-                            fixed32 |= Int32(position[i * 3 + 2]) << 16
-                            if (fixed32 & 0x800000) != 0 {
-                                fixed32 |= Int32(bitPattern: 0xFF000000)  // Sign extension
-                            }
-                            result.position[i] = c.flipP[i] * (Float(fixed32) * scale)
-                        }
-                    }
-                    
-                    // Unpack scale
-                    guard scale.count >= 3 else { return }
-                    for i in 0..<3 {
-                        result.scale[i] = Float(scale[i]) / 16.0 - 10.0
-                    }
-                    
-                    // Unpack rotation
-                    if usesQuaternionSmallestThree {
-                        guard rotation.count >= 4 else { return }
-                        unpackQuaternionSmallestThree(&result.rotation, rotation, c)
-                    } else {
-                        guard rotation.count >= 3 else { return }
-                        let xyz = Vec3f(
-                            Float(rotation[0]),
-                            Float(rotation[1]),
-                            Float(rotation[2])
-                        ) / 127.5 - Vec3f(1, 1, 1)
-                        
-                        // Apply coordinate flips
-                        let flippedXyz = Vec3f(
-                            xyz.x * c.flipQ.x,
-                            xyz.y * c.flipQ.y,
-                            xyz.z * c.flipQ.z
-                        )
-                        
-                        result.rotation.x = flippedXyz.x
-                        result.rotation.y = flippedXyz.y
-                        result.rotation.z = flippedXyz.z
-                        result.rotation.w = sqrt(max(0.0, 1.0 - flippedXyz.squaredNorm))
-                    }
+        // Unpack position based on format
+        if usesFloat16 {
+            guard position.count >= 6 else { return result }
+            
+            position.withUnsafeBytes { ptr in
+                let halfPtr = ptr.baseAddress!.assumingMemoryBound(to: UInt16.self)
+                for i in 0..<3 {
+                    result.position[i] = c.flipP[i] * float16ToFloat32(halfPtr[i])
                 }
             }
+        } else {
+            guard position.count >= 9 else { return result }
+            
+            // Decode 24-bit fixed point coordinates
+            let scale = 1.0 / Float(1 << fractionalBits)
+            for i in 0..<3 {
+                var fixed32: Int32 = Int32(position[i * 3])
+                fixed32 |= Int32(position[i * 3 + 1]) << 8
+                fixed32 |= Int32(position[i * 3 + 2]) << 16
+                if (fixed32 & 0x800000) != 0 {
+                    fixed32 |= Int32(bitPattern: 0xFF000000)  // Sign extension
+                }
+                result.position[i] = c.flipP[i] * (Float(fixed32) * scale)
+            }
+        }
+        
+        // Unpack scale
+        guard scale.count >= 3 else { return result }
+        for i in 0..<3 {
+            result.scale[i] = Float(scale[i]) / 16.0 - 10.0
+        }
+        
+        // Unpack rotation
+        if usesQuaternionSmallestThree {
+            guard rotation.count >= 4 else { return result }
+            unpackQuaternionSmallestThree(&result.rotation, rotation, c)
+        } else {
+            guard rotation.count >= 3 else { return result }
+            unpackQuaternionFirstThree(&result.rotation, rotation, c)
         }
         
         // Unpack alpha
@@ -318,6 +297,30 @@ public struct PackedPoint {
     // Total: 20 bytes, aligned to 4 bytes = 20 bytes
 }
 
+/// Unpacks quaternion using first-three encoding from 3 bytes  
+private func unpackQuaternionFirstThree(_ result: inout Quat4f, _ rotation: [UInt8], _ c: CoordinateConverter = CoordinateConverter()) {
+    guard rotation.count >= 3 else { return }
+    
+    let xyz = Vec3f(
+        Float(rotation[0]),
+        Float(rotation[1]),
+        Float(rotation[2])
+    ) / 127.5 - Vec3f(1, 1, 1)
+    
+    // Apply coordinate flips
+    let flippedXyz = Vec3f(
+        xyz.x * c.flipQ.x,
+        xyz.y * c.flipQ.y,
+        xyz.z * c.flipQ.z
+    )
+    
+    result.x = flippedXyz.x
+    result.y = flippedXyz.y
+    result.z = flippedXyz.z
+    // Compute the real component - we know the quaternion is normalized and w is non-negative
+    result.w = sqrt(max(0.0, 1.0 - flippedXyz.squaredNorm))
+}
+
 /// Unpacks quaternion using smallest-three encoding from 4 bytes
 private func unpackQuaternionSmallestThree(_ result: inout Quat4f, _ rotation: [UInt8], _ c: CoordinateConverter) {
     guard rotation.count >= 4 else { return }
@@ -341,14 +344,14 @@ private func unpackQuaternionSmallestThree(_ result: inout Quat4f, _ rotation: [
     if val3 >= 512 { val3 -= 1024 } // Sign extension
     
     // Convert to normalized float values
-    let scale = Float(1.0 / 511.0)
-    let vals = [Float(val1) * scale, Float(val2) * scale, Float(val3) * scale]
+    let vals = [Float(val1), Float(val2), Float(val3)]
     
     // Place the three smallest components
     var compIdx = 0
     for i in 0..<4 {
         if i != largestIdx {
-            components[i] = vals[compIdx] * c.flipQ[i]
+            let normalizedVal = sqrt1_2 * Float(vals[compIdx]) / Float((1 << 9) - 1)
+            components[i] = normalizedVal * c.flipQ[i]
             compIdx += 1
         }
     }

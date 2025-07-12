@@ -226,6 +226,12 @@ public extension GaussianCloud {
     
     /// Saves the gaussian cloud to a compressed SPZ file
     static func save(_ cloud: GaussianCloud, to url: URL, from coordinateSystem: CoordinateSystem = .unspecified) throws {
+        let data = try save(cloud, from: coordinateSystem)
+        try data.write(to: url)
+    }
+    
+    /// Saves the gaussian cloud to compressed SPZ data
+    static func save(_ cloud: GaussianCloud, from coordinateSystem: CoordinateSystem = .unspecified) throws -> Data {
         let packed = packGaussians(cloud, from: coordinateSystem)
         let serialized = packed.serialize()
         
@@ -315,12 +321,17 @@ public extension GaussianCloud {
         compressedData.append(contentsOf: withUnsafeBytes(of: crc.littleEndian) { Data($0) })
         compressedData.append(contentsOf: withUnsafeBytes(of: UInt32(serialized.count).littleEndian) { Data($0) })
         
-        try compressedData.write(to: url)
+        return compressedData
     }
     
     /// Loads a gaussian cloud from a compressed SPZ file
     static func load(from url: URL, to coordinateSystem: CoordinateSystem = .unspecified) throws -> GaussianCloud {
         let data = try Data(contentsOf: url)
+        return try load(from: data, to: coordinateSystem)
+    }
+    
+    /// Loads a gaussian cloud from compressed SPZ data
+    static func load(from data: Data, to coordinateSystem: CoordinateSystem = .unspecified) throws -> GaussianCloud {
         guard let decompressed = decompressGzipped(data) else {
             throw SPZError.decompressionError
         }
@@ -461,17 +472,20 @@ public func unpackGaussians(_ packed: PackedGaussians, to coordinateSystem: Coor
 
 /// Packs quaternion using smallest-three encoding into 4 bytes
 private func packQuaternionSmallestThree(_ q: Quat4f, _ rotations: inout [UInt8], _ offset: Int) {
+    // Normalize the quaternion
+    let normalized = q.normalized
+    
     // Find the largest component by absolute value
-    let absVals = [abs(q.x), abs(q.y), abs(q.z), abs(q.w)]
+    let absVals = [abs(normalized.x), abs(normalized.y), abs(normalized.z), abs(normalized.w)]
     let largestIdx = absVals.enumerated().max(by: { $0.element < $1.element })!.offset
     
-    // Ensure the largest component is positive
-    var quaternion = q
+    // Ensure the largest component is positive (since -q represents the same rotation as q)
+    var quaternion = normalized
     if quaternion[largestIdx] < 0 {
         quaternion = -quaternion
     }
     
-    // Get the three smallest components
+    // Get the three smallest components and convert to normalized values
     var smallestThree: [Float] = []
     for i in 0..<4 {
         if i != largestIdx {
@@ -479,20 +493,20 @@ private func packQuaternionSmallestThree(_ q: Quat4f, _ rotations: inout [UInt8]
         }
     }
     
-    // Convert to 10-bit signed integers
-    let scale = Float(511.0)  // 2^9 - 1
-    let vals = smallestThree.map { Int16(max(-511, min(511, $0 * scale))) }
+    // Do compression using sign bit and 9-bit precision per element
+    var comp: UInt32 = UInt32(largestIdx)
+    for i in 0..<3 {
+        let val = smallestThree[i]
+        let negbit: UInt32 = val < 0 ? 1 : 0
+        let mag = UInt32(Float((1 << 9) - 1) * (abs(val) / sqrt1_2) + 0.5)
+        comp = (comp << 10) | (negbit << 9) | mag
+    }
     
-    // Pack into 4 bytes
-    // First 10 bits: vals[0]
-    rotations[offset + 0] = UInt8(vals[0] & 0xFF)
-    rotations[offset + 1] = UInt8(((vals[0] >> 8) & 0x03) | ((vals[1] & 0x3F) << 2))
-    
-    // Next 10 bits: vals[1] (bits 2-11)
-    rotations[offset + 2] = UInt8(((vals[1] >> 6) & 0x0F) | ((vals[2] & 0x0F) << 4))
-    
-    // Last 10 bits: vals[2] (bits 4-13) + 2 bits for largest index
-    rotations[offset + 3] = UInt8(((vals[2] >> 4) & 0x3F) | (UInt8(largestIdx) << 6))
+    // Ensure little-endianness on all platforms
+    rotations[offset + 0] = UInt8(comp & 0xFF)
+    rotations[offset + 1] = UInt8((comp >> 8) & 0xFF)
+    rotations[offset + 2] = UInt8((comp >> 16) & 0xFF)
+    rotations[offset + 3] = UInt8((comp >> 24) & 0xFF)
 }
 
 private func packGaussians(_ cloud: GaussianCloud, from coordinateSystem: CoordinateSystem = .unspecified) -> PackedGaussians {
@@ -547,7 +561,7 @@ private func packGaussians(_ cloud: GaussianCloud, from coordinateSystem: Coordi
     // Pack rotations
     for i in 0..<numPoints {
         // Normalize the quaternion, make w positive, then store xyz
-        var q = Quat4f(
+        let q = Quat4f(
             cloudToConvert.rotations[i * 4 + 0].isFinite ? cloudToConvert.rotations[i * 4 + 0] : 0.0,
             cloudToConvert.rotations[i * 4 + 1].isFinite ? cloudToConvert.rotations[i * 4 + 1] : 0.0,
             cloudToConvert.rotations[i * 4 + 2].isFinite ? cloudToConvert.rotations[i * 4 + 2] : 0.0,
@@ -641,7 +655,7 @@ private func checkSizes(_ cloud: GaussianCloud) -> Bool {
 private func checkSizes(_ packed: PackedGaussians, numPoints: Int, shDim: Int, usesFloat16: Bool) -> Bool {
     guard packed.positions.count == numPoints * 3 * (usesFloat16 ? 2 : 3) else { return false }
     guard packed.scales.count == numPoints * 3 else { return false }
-    guard packed.rotations.count == numPoints * 4 else { return false }  // 4 bytes for smallest-three encoding
+    guard packed.rotations.count == numPoints * (packed.usesQuaternionSmallestThree ? 4 : 3) else { return false }
     guard packed.alphas.count == numPoints else { return false }
     guard packed.colors.count == numPoints * 3 else { return false }
     guard packed.sh.count == numPoints * shDim * 3 else { return false }

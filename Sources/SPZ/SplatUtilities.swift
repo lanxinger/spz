@@ -7,6 +7,9 @@ import zlib
 /// Scale factor for DC color components
 public let colorScale: Float = 0.15
 
+/// 1/sqrt(2) constant for quaternion compression
+public let sqrt1_2: Float = 0.707106781186547524401
+
 // MARK: - Math Utilities
 
 /// Sigmoid activation function
