@@ -83,7 +83,7 @@ public struct UnpackedGaussian {
     }
 }
 
-/// Represents a single low precision gaussian. Each gaussian has exactly 64 bytes, even if it does
+/// Represents a single low precision gaussian. Each gaussian has exactly 65 bytes, even if it does
 /// not have full spherical harmonics.
 public struct PackedGaussian {
     var position: [UInt8]
@@ -97,7 +97,7 @@ public struct PackedGaussian {
     
     init() {
         position = Array(repeating: 0, count: 9)
-        rotation = Array(repeating: 0, count: 3)
+        rotation = Array(repeating: 0, count: 4)
         scale = Array(repeating: 0, count: 3)
         color = Array(repeating: 0, count: 3)
         alpha = 0
@@ -106,7 +106,7 @@ public struct PackedGaussian {
         shB = Array(repeating: 0, count: 15)
     }
     
-    func unpack(usesFloat16: Bool, fractionalBits: Int, converter: CoordinateConverter? = nil) -> UnpackedGaussian {
+    func unpack(usesFloat16: Bool, usesQuaternionSmallestThree: Bool, fractionalBits: Int, converter: CoordinateConverter? = nil) -> UnpackedGaussian {
         var result = UnpackedGaussian()
         let c = converter ?? CoordinateConverter()
         
@@ -145,24 +145,29 @@ public struct PackedGaussian {
                     }
                     
                     // Unpack rotation
-                    guard rotation.count >= 3 else { return }
-                    let xyz = Vec3f(
-                        Float(rotation[0]),
-                        Float(rotation[1]),
-                        Float(rotation[2])
-                    ) / 127.5 - Vec3f(1, 1, 1)
-                    
-                    // Apply coordinate flips
-                    let flippedXyz = Vec3f(
-                        xyz.x * c.flipQ.x,
-                        xyz.y * c.flipQ.y,
-                        xyz.z * c.flipQ.z
-                    )
-                    
-                    result.rotation.x = flippedXyz.x
-                    result.rotation.y = flippedXyz.y
-                    result.rotation.z = flippedXyz.z
-                    result.rotation.w = sqrt(max(0.0, 1.0 - flippedXyz.squaredNorm))
+                    if usesQuaternionSmallestThree {
+                        guard rotation.count >= 4 else { return }
+                        unpackQuaternionSmallestThree(&result.rotation, rotation, c)
+                    } else {
+                        guard rotation.count >= 3 else { return }
+                        let xyz = Vec3f(
+                            Float(rotation[0]),
+                            Float(rotation[1]),
+                            Float(rotation[2])
+                        ) / 127.5 - Vec3f(1, 1, 1)
+                        
+                        // Apply coordinate flips
+                        let flippedXyz = Vec3f(
+                            xyz.x * c.flipQ.x,
+                            xyz.y * c.flipQ.y,
+                            xyz.z * c.flipQ.z
+                        )
+                        
+                        result.rotation.x = flippedXyz.x
+                        result.rotation.y = flippedXyz.y
+                        result.rotation.z = flippedXyz.z
+                        result.rotation.w = sqrt(max(0.0, 1.0 - flippedXyz.squaredNorm))
+                    }
                 }
             }
         }
@@ -196,6 +201,7 @@ public struct PackedGaussians {
     public var shDegree: Int = 0
     public var fractionalBits: Int = 0
     public var antialiased: Bool = false
+    public var usesQuaternionSmallestThree: Bool = true
     
     public var positions: [UInt8] = []
     public var scales: [UInt8] = []
@@ -237,7 +243,10 @@ public struct PackedGaussians {
         
         // Copy other components safely
         result.scale = Array(scales[start3..<(start3 + 3)])
-        result.rotation = Array(rotations[start3..<(start3 + 3)])
+        let rotationBytes = usesQuaternionSmallestThree ? 4 : 3
+        let rotStart = index * rotationBytes
+        guard rotStart + rotationBytes <= rotations.count else { return result }
+        result.rotation = Array(rotations[rotStart..<(rotStart + rotationBytes)])
         result.color = Array(colors[start3..<(start3 + 3)])
         result.alpha = alphas[index]
         
@@ -270,7 +279,7 @@ public struct PackedGaussians {
     }
     
     func unpack(_ index: Int, converter: CoordinateConverter? = nil) -> UnpackedGaussian {
-        at(index).unpack(usesFloat16: usesFloat16, fractionalBits: fractionalBits, converter: converter)
+        at(index).unpack(usesFloat16: usesFloat16, usesQuaternionSmallestThree: usesQuaternionSmallestThree, fractionalBits: fractionalBits, converter: converter)
     }
 }
 
@@ -302,11 +311,57 @@ private func float16ToFloat32(_ half: UInt16) -> Float {
 @frozen
 public struct PackedPoint {
     var position: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8)  // 9 bytes
-    var rotation: (UInt8, UInt8, UInt8)  // 3 bytes
+    var rotation: (UInt8, UInt8, UInt8, UInt8)  // 4 bytes (for smallest-three encoding)
     var scale: (UInt8, UInt8, UInt8)     // 3 bytes
     var color: (UInt8, UInt8, UInt8)     // 3 bytes
     var alpha: UInt8                      // 1 byte
-    // Total: 19 bytes, aligned to 4 bytes = 20 bytes
+    // Total: 20 bytes, aligned to 4 bytes = 20 bytes
+}
+
+/// Unpacks quaternion using smallest-three encoding from 4 bytes
+private func unpackQuaternionSmallestThree(_ result: inout Quat4f, _ rotation: [UInt8], _ c: CoordinateConverter) {
+    guard rotation.count >= 4 else { return }
+    
+    // Extract the largest component index (2 bits)
+    let largestIdx = Int(rotation[3] >> 6)
+    
+    // Extract 10-bit signed values for the three smallest components
+    var components = [Float](repeating: 0, count: 4)
+    
+    // First component: bits 0-9 from bytes 0-1
+    var val1 = Int16(rotation[0]) | (Int16(rotation[1] & 0x03) << 8)
+    if val1 >= 512 { val1 -= 1024 } // Sign extension
+    
+    // Second component: bits 2-11 from bytes 1-2  
+    var val2 = Int16((rotation[1] >> 2) | ((rotation[2] & 0x0F) << 6))
+    if val2 >= 512 { val2 -= 1024 } // Sign extension
+    
+    // Third component: bits 4-13 from bytes 2-3
+    var val3 = Int16((rotation[2] >> 4) | ((rotation[3] & 0x3F) << 4))
+    if val3 >= 512 { val3 -= 1024 } // Sign extension
+    
+    // Convert to normalized float values
+    let scale = Float(1.0 / 511.0)
+    let vals = [Float(val1) * scale, Float(val2) * scale, Float(val3) * scale]
+    
+    // Place the three smallest components
+    var compIdx = 0
+    for i in 0..<4 {
+        if i != largestIdx {
+            components[i] = vals[compIdx] * c.flipQ[i]
+            compIdx += 1
+        }
+    }
+    
+    // Compute the largest component using quaternion normalization
+    let sumSquares = components[0] * components[0] + components[1] * components[1] + 
+                    components[2] * components[2] + components[3] * components[3]
+    components[largestIdx] = sqrt(max(0.0, 1.0 - sumSquares))
+    
+    result.x = components[0]
+    result.y = components[1] 
+    result.z = components[2]
+    result.w = components[3]
 }
 
 private func unpackPositionsVectorized(_ packed: PackedGaussians) -> [Float] {

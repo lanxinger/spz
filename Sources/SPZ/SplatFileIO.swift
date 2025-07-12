@@ -77,7 +77,7 @@ private extension UInt32 {
 /// Header structure for packed gaussians file format
 private struct PackedGaussiansHeader {
     static let magic: UInt32 = 0x5053474e  // NGSP = Niantic gaussian splat
-    static let version: UInt32 = 2
+    static let version: UInt32 = 3
     
     var magic: UInt32 = PackedGaussiansHeader.magic
     var version: UInt32 = PackedGaussiansHeader.version
@@ -147,7 +147,7 @@ extension PackedGaussians {
             throw SPZError.invalidHeader
         }
         
-        guard header.version >= 1 && header.version <= 2 else {
+        guard header.version >= 1 && header.version <= 3 else {
             throw SPZError.unsupportedVersion
         }
         
@@ -163,13 +163,14 @@ extension PackedGaussians {
         let numPoints = Int(header.numPoints)
         let shDim = dimForDegree(Int(header.shDegree))
         let usesFloat16 = header.version == 1
+        let usesQuaternionSmallestThree = header.version >= 3
         
         // Calculate expected sizes
         let posSize = numPoints * 3 * (usesFloat16 ? 2 : 3)
         let alphasSize = numPoints
         let colorsSize = numPoints * 3
         let scalesSize = numPoints * 3
-        let rotationsSize = numPoints * 3
+        let rotationsSize = numPoints * (usesQuaternionSmallestThree ? 4 : 3)
         let shSize = numPoints * shDim * 3
         
         // Calculate total expected size
@@ -186,6 +187,7 @@ extension PackedGaussians {
         result.shDegree = Int(header.shDegree)
         result.fractionalBits = Int(header.fractionalBits)
         result.antialiased = (header.flags & 0x1) != 0
+        result.usesQuaternionSmallestThree = usesQuaternionSmallestThree
         
         var offset = PackedGaussiansHeader.size
         
@@ -457,6 +459,42 @@ public func unpackGaussians(_ packed: PackedGaussians, to coordinateSystem: Coor
     return result
 }
 
+/// Packs quaternion using smallest-three encoding into 4 bytes
+private func packQuaternionSmallestThree(_ q: Quat4f, _ rotations: inout [UInt8], _ offset: Int) {
+    // Find the largest component by absolute value
+    let absVals = [abs(q.x), abs(q.y), abs(q.z), abs(q.w)]
+    let largestIdx = absVals.enumerated().max(by: { $0.element < $1.element })!.offset
+    
+    // Ensure the largest component is positive
+    var quaternion = q
+    if quaternion[largestIdx] < 0 {
+        quaternion = -quaternion
+    }
+    
+    // Get the three smallest components
+    var smallestThree: [Float] = []
+    for i in 0..<4 {
+        if i != largestIdx {
+            smallestThree.append(quaternion[i])
+        }
+    }
+    
+    // Convert to 10-bit signed integers
+    let scale = Float(511.0)  // 2^9 - 1
+    let vals = smallestThree.map { Int16(max(-511, min(511, $0 * scale))) }
+    
+    // Pack into 4 bytes
+    // First 10 bits: vals[0]
+    rotations[offset + 0] = UInt8(vals[0] & 0xFF)
+    rotations[offset + 1] = UInt8(((vals[0] >> 8) & 0x03) | ((vals[1] & 0x3F) << 2))
+    
+    // Next 10 bits: vals[1] (bits 2-11)
+    rotations[offset + 2] = UInt8(((vals[1] >> 6) & 0x0F) | ((vals[2] & 0x0F) << 4))
+    
+    // Last 10 bits: vals[2] (bits 4-13) + 2 bits for largest index
+    rotations[offset + 3] = UInt8(((vals[2] >> 4) & 0x3F) | (UInt8(largestIdx) << 6))
+}
+
 private func packGaussians(_ cloud: GaussianCloud, from coordinateSystem: CoordinateSystem = .unspecified) -> PackedGaussians {
     guard checkSizes(cloud) else {
         return PackedGaussians()
@@ -477,11 +515,12 @@ private func packGaussians(_ cloud: GaussianCloud, from coordinateSystem: Coordi
     packed.shDegree = cloud.shDegree
     packed.fractionalBits = 12
     packed.antialiased = cloud.antialiased
+    packed.usesQuaternionSmallestThree = true  // Use version 3 encoding
     
     // Allocate arrays
     packed.positions = Array(repeating: 0, count: numPoints * 3 * 3)
     packed.scales = Array(repeating: 0, count: numPoints * 3)
-    packed.rotations = Array(repeating: 0, count: numPoints * 3)
+    packed.rotations = Array(repeating: 0, count: numPoints * 4)  // 4 bytes for smallest-three encoding
     packed.alphas = Array(repeating: 0, count: numPoints)
     packed.colors = Array(repeating: 0, count: numPoints * 3)
     packed.sh = Array(repeating: 0, count: numPoints * shDim * 3)
@@ -515,13 +554,8 @@ private func packGaussians(_ cloud: GaussianCloud, from coordinateSystem: Coordi
             cloudToConvert.rotations[i * 4 + 3].isFinite ? cloudToConvert.rotations[i * 4 + 3] : 1.0
         ).normalized
         
-        // Make w positive
-        let scale: Float = q.w < 0 ? -127.5 : 127.5
-        q = q * scale + Quat4f(repeating: 127.5)
-        
-        packed.rotations[i * 3 + 0] = toUInt8(q.x)
-        packed.rotations[i * 3 + 1] = toUInt8(q.y)
-        packed.rotations[i * 3 + 2] = toUInt8(q.z)
+        // Pack quaternion using smallest-three encoding (version 3)
+        packQuaternionSmallestThree(q, &packed.rotations, i * 4)
     }
     
     // Pack alphas
@@ -607,7 +641,7 @@ private func checkSizes(_ cloud: GaussianCloud) -> Bool {
 private func checkSizes(_ packed: PackedGaussians, numPoints: Int, shDim: Int, usesFloat16: Bool) -> Bool {
     guard packed.positions.count == numPoints * 3 * (usesFloat16 ? 2 : 3) else { return false }
     guard packed.scales.count == numPoints * 3 else { return false }
-    guard packed.rotations.count == numPoints * 3 else { return false }
+    guard packed.rotations.count == numPoints * 4 else { return false }  // 4 bytes for smallest-three encoding
     guard packed.alphas.count == numPoints else { return false }
     guard packed.colors.count == numPoints * 3 else { return false }
     guard packed.sh.count == numPoints * shDim * 3 else { return false }
