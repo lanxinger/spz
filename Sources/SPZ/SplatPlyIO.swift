@@ -39,28 +39,38 @@ extension GaussianCloud {
         var numPoints = 0
         var fields: [String: Int] = [:]  // name -> index
         var headerEndOffset: UInt64 = 0
-        
+
         // Read the file line by line until we find end_header
+        // We need to track actual byte offset including comments and whitespace
         try fileHandle.seek(toOffset: 0)
         var headerEnded = false
-        var currentOffset: UInt64 = 0
-        
+
         while !headerEnded {
             guard let line = fileHandle.readLine() else {
                 throw SPZError.invalidFormat("Unexpected end of file while reading header")
             }
-            currentOffset += UInt64(line.count + 1)  // +1 for newline
-            
-            if line.starts(with: "element vertex ") {
-                numPoints = Int(line.dropFirst("element vertex ".count)) ?? 0
+            // Track actual bytes read (original line + newline)
+            // Note: readLine() trims whitespace, but we need original byte count
+            // We'll recalculate offset after finding end_header
+
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            // Skip empty or comment lines
+            if trimmed.isEmpty || trimmed.hasPrefix("comment") {
+                continue
+            }
+
+            if trimmed.starts(with: "element vertex ") {
+                numPoints = Int(trimmed.dropFirst("element vertex ".count)) ?? 0
                 guard numPoints > 0 && numPoints <= 10 * 1024 * 1024 else {
                     throw SPZError.invalidFormat("Invalid vertex count: \(numPoints)")
                 }
-            } else if line.starts(with: "property float ") {
-                let name = String(line.dropFirst("property float ".count))
+            } else if trimmed.starts(with: "property float ") {
+                let name = String(trimmed.dropFirst("property float ".count))
                 fields[name] = fields.count
-            } else if line == "end_header" {
-                headerEndOffset = currentOffset
+            } else if trimmed == "end_header" {
+                // Get actual file position after end_header line
+                headerEndOffset = fileHandle.offsetInFile
                 headerEnded = true
             }
         }
@@ -358,7 +368,7 @@ extension FileHandle {
     func readLine() -> String? {
         var line = Data()
         let bufferSize = 1
-        
+
         while true {
             let data: Data
             if #available(iOS 13.4, macOS 10.15.4, *) {
@@ -367,9 +377,9 @@ extension FileHandle {
             } else {
                 data = self.readData(ofLength: bufferSize)
             }
-            
+
             if data.isEmpty { break }
-            
+
             if let byte = data.first {
                 if byte == UInt8(ascii: "\n") {
                     break
@@ -377,8 +387,27 @@ extension FileHandle {
                 line.append(byte)
             }
         }
-        
+
         return String(data: line, encoding: .ascii)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Reads the next non-empty, non-comment header line from a PLY file.
+    /// Skips lines that are empty, whitespace-only, or start with "comment".
+    func readNextHeaderLine() -> String? {
+        while let line = readLine() {
+            // Skip empty or whitespace-only lines
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty {
+                continue
+            }
+            // Skip comment lines
+            if trimmed.hasPrefix("comment") {
+                continue
+            }
+            return trimmed
+        }
+        // EOF or error
+        return nil
     }
 }
 

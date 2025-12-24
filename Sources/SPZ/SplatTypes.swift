@@ -57,8 +57,12 @@ public struct GaussianCloud {
     /// Converts between two coordinate systems, for example from RDF (ply format) to RUB (used by spz).
     /// This is performed in-place.
     public mutating func convertCoordinates(from: CoordinateSystem, to: CoordinateSystem) {
+        guard numPoints > 0 else {
+            // There is nothing to convert.
+            return
+        }
         let c = coordinateConverter(from: from, to: to)
-        
+
         // Transform positions
         for i in stride(from: 0, to: positions.count, by: 3) {
             positions[i + 0] *= c.flipP.x
