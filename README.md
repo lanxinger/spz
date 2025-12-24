@@ -1,10 +1,131 @@
 # spz
 
-`.spz` is a file format for compressed 3D gaussian splats. This directory contains a C++ library
-for saving and loading data in the .spz format.
+`.spz` is a file format for compressed 3D gaussian splats. This repository contains a Swift
+implementation for saving and loading data in the .spz format, fully compatible with the
+[official C++ implementation](https://github.com/nianticlabs/spz).
 
 spz encoded splats are typically around 10x smaller than the corresponding .ply files,
 with minimal visual differences between the two.
+
+## Swift Implementation
+
+### Installation
+
+Add the package to your `Package.swift`:
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/lanxinger/spz.git", from: "1.0.0")
+]
+```
+
+Or in Xcode: File > Add Package Dependencies and enter the repository URL.
+
+### Requirements
+
+- iOS 13.0+ / macOS 11.0+
+- Swift 5.7+
+- zlib (system library, no additional dependencies)
+
+### Usage
+
+```swift
+import SPZ
+
+// Load from SPZ file
+let cloud = try GaussianCloud.load(from: spzURL, to: .rub)
+
+// Load from PLY file
+let cloud = try GaussianCloud.loadFromPly(url: plyURL, to: .rub)
+
+// Save to SPZ file
+try cloud.save(to: outputURL, from: .rub)
+
+// Save to PLY file
+try cloud.saveToPly(url: outputURL, from: .rub)
+
+// Access gaussian data
+print("Points: \(cloud.numPoints)")
+print("SH Degree: \(cloud.shDegree)")
+// Arrays: cloud.positions, cloud.scales, cloud.rotations, cloud.alphas, cloud.colors, cloud.sh
+```
+
+### API
+
+#### GaussianCloud
+
+The main data structure representing a cloud of 3D gaussians:
+
+```swift
+public struct GaussianCloud {
+    var numPoints: Int           // Number of gaussians
+    var shDegree: Int            // Spherical harmonics degree (0-3)
+    var antialiased: Bool        // Mip splatting flag
+    var positions: [Float]       // XYZ positions (numPoints * 3)
+    var scales: [Float]          // Log-scale XYZ (numPoints * 3)
+    var rotations: [Float]       // XYZW quaternions (numPoints * 4)
+    var alphas: [Float]          // Pre-sigmoid alpha (numPoints)
+    var colors: [Float]          // SH DC components (numPoints * 3)
+    var sh: [Float]              // Spherical harmonics coefficients
+}
+```
+
+#### Loading
+
+```swift
+// Load from SPZ file with coordinate conversion
+static func load(from url: URL, to: CoordinateSystem) throws -> GaussianCloud
+
+// Load from SPZ Data
+static func load(from data: Data, to: CoordinateSystem) throws -> GaussianCloud
+
+// Load from PLY file
+static func loadFromPly(url: URL, to: CoordinateSystem) throws -> GaussianCloud
+```
+
+#### Saving
+
+```swift
+// Save to SPZ file
+func save(to url: URL, from: CoordinateSystem) throws
+
+// Save to SPZ Data
+func save(from: CoordinateSystem) throws -> Data
+
+// Save to PLY file
+func saveToPly(url: URL, from: CoordinateSystem) throws
+```
+
+#### Coordinate Systems
+
+```swift
+public enum CoordinateSystem {
+    case unspecified  // No conversion
+    case rub          // Right-Up-Back (OpenGL, three.js) - SPZ internal format
+    case rdf          // Right-Down-Front (PLY format)
+    case luf          // Left-Up-Front (GLB format)
+    case ruf          // Right-Up-Front (Unity)
+    // ... and more
+}
+```
+
+### Command Line Tool
+
+The package includes `spz-tool` for file conversion:
+
+```bash
+# Build the tool
+swift build -c release
+
+# Convert PLY to SPZ
+.build/release/spz-tool convert input.ply output.spz
+
+# Convert SPZ to PLY
+.build/release/spz-tool convert input.spz output.ply
+
+# Show file info
+.build/release/spz-tool info input.spz
+```
 
 ## Internals
 
@@ -14,72 +135,9 @@ SPZ stores data internally in an RUB coordinate system following the OpenGL and 
 convention. This differs from other data formats such as PLY (which typically uses RDF), GLB (which
 typically uses LUF), or Unity (which typically uses RUF). To aid with coordinate system conversions,
 callers should specify the coordinate system their Gaussian Cloud data is represented in when saving
-and what coordinate system their rendering system uses when loading. These are specified in the
-PackOptions and UnpackOptions respectively.  If the coordinate system is `UNSPECIFIED`, data will
-be saved and loaded without conversion, which may harm interoperability.
-
-## Implementations
-
-### C++
-
-Requires `libz` as the only dependent library, otherwise the code is completely self-contained.
-A CMake build system is provided for convenience.
-
-## API
-
-```
-bool saveSpz(
-   const GaussianCloud &gaussians, PackOptions &options, std::vector<uint8_t> *output);
-```
-
-Converts a cloud of Gaussians in `.spz` format to a vector of bytes.
-
-   - `gaussians`: The Gaussians to save
-   - `options`: Flags that control the packing behavior.
-   - `output`: A vector that will be populated with bytes encoded in .spz format
-   - Returns true on success and false on failure.
-
----
-
-```
-bool saveSpz(
-   const GaussianCloud &gaussians, const PackOptions &options, const std::string
-&filename);
-```
-
-Saves a cloud of Gaussians in `.spz` format to a file
-
-   - `gaussians`: The Gaussians to save
-   - `options`: Flags that control the packing behavior.
-   - `filename`: The path to the file to save to.
-   - Returns true on success and false on failure.
-
----
-
-```
-GaussianCloud loadSpz(const std::vector<uint8_t> &data, const UnpackOptions &opti
-ons);
-```
-
-Loads a cloud of Gaussians from bytes in `.spz` format.
-
-   - `data`: A vector containing the encoded spz data
-   - `options`: Flags that control the unpacking behavior.
-   - Returns a `GaussianCloud` decoded from the vector. In case of an error, this will return
-     a result with no gaussians
-
----
-
-```
-GaussianCloud loadSpz(const std::string &filename, const UnpackOptions &options);
-```
-
-Loads a cloud of Gaussians from a file in `.spz` format.
-
-   - `filename`: The path to the file to load from.
-   - `options`: Flags that control the unpacking behavior.
-   - Returns a `GaussianCloud` decoded from the file. In case of an error, this will return
-     a result with no gaussians
+(the `from` parameter) and what coordinate system their rendering system uses when loading (the `to`
+parameter). If the coordinate system is `.unspecified`, data will be saved and loaded without
+conversion, which may harm interoperability.
 
 ## File Format
 
@@ -160,15 +218,7 @@ and 4 bits of precision for degrees 1 and 2, but this may be changed in the futu
 backwards compatibility.
 
 
-## Python Bindings
+## Other Implementations
 
-The SPZ library provides Python bindings built with [nanobind](https://nanobind.readthedocs.io/) that offer a convenient interface for loading, manipulating, and saving 3D Gaussian splats from Python.
-
-### Installation
-```bash
-git clone https://github.com/nianticlabs/spz.git
-cd spz
-pip install .
-```
-
-Please see src/python/README.md for more details and usage examples
+- **C++**: See the [official Niantic Labs repository](https://github.com/nianticlabs/spz) for the reference C++ implementation
+- **Python**: Python bindings are available in the [official repository](https://github.com/nianticlabs/spz) via nanobind
