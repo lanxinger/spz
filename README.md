@@ -6,9 +6,6 @@ for saving and loading data in the .spz format.
 spz encoded splats are typically around 10x smaller than the corresponding .ply files,
 with minimal visual differences between the two.
 
-### Discord
-Join the [Scaniverse Discord](https://discord.gg/xKtCxvEmxa) to discuss SPZ-related topics with Niantic developers and community contributors. 
-
 ## Internals
 
 ### Coordinate System
@@ -161,3 +158,17 @@ Each coefficient is represented as an 8-bit signed integer. Additional quantizat
 to attain a higher compression ratio. This library currently uses 5 bits of precision for degree 0
 and 4 bits of precision for degrees 1 and 2, but this may be changed in the future without breaking
 backwards compatibility.
+
+
+## Python Bindings
+
+The SPZ library provides Python bindings built with [nanobind](https://nanobind.readthedocs.io/) that offer a convenient interface for loading, manipulating, and saving 3D Gaussian splats from Python.
+
+### Installation
+```bash
+git clone https://github.com/nianticlabs/spz.git
+cd spz
+pip install .
+```
+
+Please see src/python/README.md for more details and usage examples
