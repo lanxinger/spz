@@ -46,6 +46,7 @@ public func dimForDegree(_ degree: Int) -> Int {
     case 1: return 3
     case 2: return 8
     case 3: return 15
+    case 4: return 24
     default:
         print("[SPZ: ERROR] Unsupported SH degree: \(degree)")
         return 0
@@ -57,7 +58,8 @@ public func degreeForDim(_ dim: Int) -> Int {
     if dim < 3 { return 0 }
     if dim < 8 { return 1 }
     if dim < 15 { return 2 }
-    return 3
+    if dim < 24 { return 3 }
+    return 4
 }
 
 // MARK: - Compression Utilities
@@ -197,6 +199,34 @@ private final class MemoryPool {
 }
 
 private let sharedMemoryPool = MemoryPool()
+
+/// Compresses data using ZSTD compression
+public func compressZstd(_ data: Data) -> Data? {
+    let srcSize = data.count
+    guard srcSize > 0 else { return Data() }
+    // Worst-case ZSTD output bound: srcSize + srcSize/8 + 512
+    let dstCapacity = srcSize + (srcSize >> 3) + 512
+    var dst = [UInt8](repeating: 0, count: dstCapacity)
+    let written = data.withUnsafeBytes { srcPtr -> Int in
+        guard let src = srcPtr.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return 0 }
+        return compression_encode_buffer(&dst, dstCapacity, src, srcSize, nil, COMPRESSION_ZSTD)
+    }
+    guard written > 0 else { return nil }
+    return Data(dst.prefix(written))
+}
+
+/// Decompresses ZSTD-compressed data given the known uncompressed size
+public func decompressZstd(_ data: Data, uncompressedSize: Int) -> Data? {
+    guard uncompressedSize >= 0 else { return nil }
+    guard uncompressedSize > 0 else { return Data() }
+    var dst = [UInt8](repeating: 0, count: uncompressedSize)
+    let written = data.withUnsafeBytes { srcPtr -> Int in
+        guard let src = srcPtr.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return 0 }
+        return compression_decode_buffer(&dst, uncompressedSize, src, data.count, nil, COMPRESSION_ZSTD)
+    }
+    guard written == uncompressedSize else { return nil }
+    return Data(dst)
+}
 
 /// Compresses data using gzip compression in parallel
 public func compressGzippedParallel(_ data: Data, chunkSize: Int = 1024 * 1024) -> Data? {

@@ -17,7 +17,7 @@ final class LoadSaveTests: XCTestCase {
         // Verify basic properties
         XCTAssertGreaterThan(cloud.numPoints, 0)
         XCTAssertGreaterThanOrEqual(cloud.shDegree, 0)
-        XCTAssertLessThanOrEqual(cloud.shDegree, 3)
+        XCTAssertLessThanOrEqual(cloud.shDegree, 4)
         
         // Verify array sizes
         XCTAssertEqual(cloud.positions.count, cloud.numPoints * 3)
@@ -113,6 +113,7 @@ private func dimForDegree(_ degree: Int) -> Int {
     case 1: return 3
     case 2: return 8
     case 3: return 15
+    case 4: return 24
     default: return 0
     }
 } 

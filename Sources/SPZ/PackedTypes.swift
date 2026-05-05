@@ -59,8 +59,7 @@ private func scaleMatrix(_ data: [Float], scale: Float, offset: Float = 0.0) -> 
     return result
 }
 
-/// Represents a single inflated gaussian. Each gaussian has 236 bytes. Although the data is easier
-/// to interpret in this format, it is not more precise than the packed format, since it was inflated.
+/// Represents a single inflated gaussian.
 public struct UnpackedGaussian {
     var position: Vec3f
     var rotation: Quat4f
@@ -70,16 +69,16 @@ public struct UnpackedGaussian {
     var shR: [Float]
     var shG: [Float]
     var shB: [Float]
-    
+
     init() {
         position = .zero
         rotation = .zero
         scale = .zero
         color = .zero
         alpha = 0
-        shR = Array(repeating: 0, count: 15)
-        shG = Array(repeating: 0, count: 15)
-        shB = Array(repeating: 0, count: 15)
+        shR = Array(repeating: 0, count: 24)
+        shG = Array(repeating: 0, count: 24)
+        shB = Array(repeating: 0, count: 24)
     }
 }
 
@@ -161,7 +160,7 @@ public struct PackedGaussian {
         }
         
         // Unpack SH coefficients
-        let shCount = min(15, shR.count)
+        let shCount = min(24, shR.count)
         for i in 0..<shCount {
             guard i < c.flipSh.count else { break }
             result.shR[i] = c.flipSh[i] * unquantizeSH(shR[i])
@@ -248,7 +247,7 @@ public struct PackedGaussians {
         }
         
         // Fill remaining SH coefficients with neutral value
-        for j in shDim..<15 {
+        for j in shDim..<24 {
             result.shR[j] = 128
             result.shG[j] = 128
             result.shB[j] = 128

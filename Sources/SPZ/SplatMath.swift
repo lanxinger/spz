@@ -220,24 +220,34 @@ public func coordinateConverter(from: CoordinateSystem, to: CoordinateSystem) ->
     converter.flipP = Vec3f(x, y, z)
     converter.flipQ = Vec3f(y * z, x * z, x * y)
     
-    // Flips for the 15 spherical harmonics coefficients
+    // Flips for 24 spherical harmonics coefficients (degrees 1–4).
+    // Derived from https://github.com/nerfstudio-project/gsplat (SphericalHarmonicsCUDA.cu).
     converter.flipSh = [
-        y,          // 0
-        z,          // 1
-        x,          // 2
-        x * y,      // 3
-        y * z,      // 4
-        1.0,        // 5
-        x * z,      // 6
-        1.0,        // 7
-        y,          // 8
-        x * y * z,  // 9
-        y,          // 10
-        z,          // 11
-        x,          // 12
-        z,          // 13
-        x           // 14
+        y,          // 0  (l=1, m=-1)
+        z,          // 1  (l=1, m=0)
+        x,          // 2  (l=1, m=1)
+        x * y,      // 3  (l=2, m=-2)
+        y * z,      // 4  (l=2, m=-1)
+        1.0,        // 5  (l=2, m=0)
+        x * z,      // 6  (l=2, m=1)
+        1.0,        // 7  (l=2, m=2)
+        y,          // 8  (l=3, m=-3)
+        x * y * z,  // 9  (l=3, m=-2)
+        y,          // 10 (l=3, m=-1)
+        z,          // 11 (l=3, m=0)
+        x,          // 12 (l=3, m=1)
+        z,          // 13 (l=3, m=2)
+        x,          // 14 (l=3, m=3)
+        x * y,      // 15 (l=4, m=-4)
+        y * z,      // 16 (l=4, m=-3)
+        x * y,      // 17 (l=4, m=-2)
+        y * z,      // 18 (l=4, m=-1)
+        1.0,        // 19 (l=4, m=0)
+        x * z,      // 20 (l=4, m=1)
+        1.0,        // 21 (l=4, m=2)
+        x * z,      // 22 (l=4, m=3)
+        y,          // 23 (l=4, m=4)
     ]
-    
+
     return converter
 }

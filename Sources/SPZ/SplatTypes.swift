@@ -12,11 +12,12 @@ public struct GaussianCloud {
     public var numPoints: Int = 0
     
     /// Degree of spherical harmonics for this splat.
-    /// Valid values are 0 through 3, where:
+    /// Valid values are 0 through 4, where:
     /// - 0: No spherical harmonics (constant color)
     /// - 1: 9 coefficients (3 coeffs x 3 channels)
     /// - 2: 24 coefficients (8 coeffs x 3 channels)
     /// - 3: 45 coefficients (15 coeffs x 3 channels)
+    /// - 4: 72 coefficients (24 coeffs x 3 channels)
     public var shDegree: Int = 0
     
     /// Whether the gaussians should be rendered in antialiased mode (mip splatting)
@@ -47,6 +48,7 @@ public struct GaussianCloud {
     /// - shDegree 1: numPoints * 9 (3 coeffs x 3 channels)
     /// - shDegree 2: numPoints * 24 (8 coeffs x 3 channels)
     /// - shDegree 3: numPoints * 45 (15 coeffs x 3 channels)
+    /// - shDegree 4: numPoints * 72 (24 coeffs x 3 channels)
     /// The color channel is the inner (fastest varying) axis, and the coefficient is the outer
     /// (slower varying) axis.
     public var sh: [Float] = []
@@ -147,5 +149,5 @@ public enum CoordinateSystem: Int {
 public struct CoordinateConverter {
     public var flipP: Vec3f = Vec3f(1.0, 1.0, 1.0)  // x, y, z flips
     public var flipQ: Vec3f = Vec3f(1.0, 1.0, 1.0)  // x, y, z flips, w is never flipped
-    public var flipSh: [Float] = Array(repeating: 1.0, count: 15)  // Flips for SH coefficients
+    public var flipSh: [Float] = Array(repeating: 1.0, count: 24)  // Flips for SH coefficients
 }
