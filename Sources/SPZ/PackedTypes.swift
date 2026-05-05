@@ -82,8 +82,7 @@ public struct UnpackedGaussian {
     }
 }
 
-/// Represents a single low precision gaussian. Each gaussian has exactly 65 bytes, even if it does
-/// not have full spherical harmonics.
+/// Represents a single low precision gaussian stored non-interleaved.
 public struct PackedGaussian {
     var position: [UInt8]
     var rotation: [UInt8]
@@ -93,16 +92,16 @@ public struct PackedGaussian {
     var shR: [UInt8]
     var shG: [UInt8]
     var shB: [UInt8]
-    
+
     init() {
         position = Array(repeating: 0, count: 9)
         rotation = Array(repeating: 0, count: 4)
-        scale = Array(repeating: 0, count: 3)
-        color = Array(repeating: 0, count: 3)
-        alpha = 0
-        shR = Array(repeating: 0, count: 15)
-        shG = Array(repeating: 0, count: 15)
-        shB = Array(repeating: 0, count: 15)
+        scale    = Array(repeating: 0, count: 3)
+        color    = Array(repeating: 0, count: 3)
+        alpha    = 0
+        shR = Array(repeating: 0, count: 24)
+        shG = Array(repeating: 0, count: 24)
+        shB = Array(repeating: 0, count: 24)
     }
     
     func unpack(usesFloat16: Bool, usesQuaternionSmallestThree: Bool, fractionalBits: Int, converter: CoordinateConverter? = nil) -> UnpackedGaussian {
@@ -246,8 +245,8 @@ public struct PackedGaussians {
             result.shB[j] = sh[idx + 2]
         }
         
-        // Fill remaining SH coefficients with neutral value
-        for j in shDim..<24 {
+        // Fill remaining SH coefficients with neutral value (bounded by allocated size)
+        for j in shDim..<result.shR.count {
             result.shR[j] = 128
             result.shG[j] = 128
             result.shB[j] = 128

@@ -270,7 +270,6 @@ private func deserializeV4(_ data: Data) throws -> PackedGaussians {
     guard header.version >= minZstdVersion &&
           header.version <= latestVersion                      else { throw SPZError.unsupportedVersion }
     guard header.shDegree <= 4                                else { throw SPZError.unsupportedSHDegree }
-    guard header.numPoints > 0                                else { throw SPZError.invalidData }
 
     let numPoints   = Int(header.numPoints)
     let shDim       = dimForDegree(Int(header.shDegree))
@@ -282,7 +281,7 @@ private func deserializeV4(_ data: Data) throws -> PackedGaussians {
     let tocEnd = tocOffset + numStreams * 16
     guard data.count >= tocEnd                                 else { throw SPZError.invalidData }
 
-    // Parse TOC
+    // Parse TOC — use sentinel -1 to flag values that overflow Int on this platform
     struct StreamInfo { var compressedSize: Int; var uncompressedSize: Int }
     var infos = [StreamInfo](repeating: StreamInfo(compressedSize: 0, uncompressedSize: 0),
                              count: numStreams)
@@ -290,9 +289,19 @@ private func deserializeV4(_ data: Data) throws -> PackedGaussians {
         let p = rawBuf.baseAddress!
         for i in 0..<numStreams {
             let base = tocOffset + i * 16
-            let cs = p.load(fromByteOffset: base,     as: UInt64.self)
-            let us = p.load(fromByteOffset: base + 8, as: UInt64.self)
-            infos[i] = StreamInfo(compressedSize: Int(cs), uncompressedSize: Int(us))
+            let cs64 = p.load(fromByteOffset: base,     as: UInt64.self)
+            let us64 = p.load(fromByteOffset: base + 8, as: UInt64.self)
+            let maxSafe = UInt64(Int.max)
+            infos[i] = StreamInfo(
+                compressedSize:   cs64 <= maxSafe ? Int(cs64) : -1,
+                uncompressedSize: us64 <= maxSafe ? Int(us64) : -1
+            )
+        }
+    }
+    // Reject any TOC field that overflowed Int or is otherwise negative
+    for info in infos {
+        guard info.compressedSize >= 0, info.uncompressedSize >= 0 else {
+            throw SPZError.invalidData
         }
     }
 
